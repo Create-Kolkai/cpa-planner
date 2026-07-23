@@ -19,5 +19,5 @@ export function getSupabaseConfig(): SupabaseConfig {
 }
 
 export function isDemoMode() {
-  return String(import.meta.env.APP_DEMO_MODE ?? "false").toLowerCase() === "true";
+  return String(import.meta.env.VITE_APP_DEMO_MODE ?? "false").toLowerCase() === "true";
 }

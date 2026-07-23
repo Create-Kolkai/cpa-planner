@@ -78,9 +78,25 @@ export async function updateRepPharmacy(id: string, patch: Partial<PharmacyInput
   return rows[0];
 }
 
-export async function searchDirectory(searchText: string) {
-  if (searchText.trim().length < 3) return [];
-  return supabaseRpc<DirectorySearchRow[]>("search_pharmacy_directory", { search_text: searchText.trim() });
+export async function searchDirectory(searchText: string, limit = 20, offset = 0) {
+  if (searchText.trim().length < 2) return [];
+  return supabaseRpc<DirectorySearchRow[]>("search_pharmacy_directory", {
+    search_text: searchText.trim(),
+    result_limit: limit,
+    result_offset: offset,
+  });
+}
+
+export async function addDirectoryPharmacyToMyList(directoryId: string, grade = "B") {
+  return supabaseRpc<RepPharmacyRow>("add_pharmacy_to_my_list", { directory_id: directoryId, selected_grade: grade });
+}
+
+export async function initializeDemoSalesRepWorkspace() {
+  return supabaseRpc<RepPharmacyRow[]>("initialize_demo_sales_rep_workspace", {});
+}
+
+export async function archiveRepPharmacy(id: string) {
+  return updateRepPharmacy(id, { active: false });
 }
 
 export function rowToPharmacyInput(row: RepPharmacyRow): PharmacyInput {

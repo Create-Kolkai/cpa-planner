@@ -2,15 +2,15 @@
 
 ## Initial Audit Findings
 
-- The repository is now initialised at `/Users/nickmeyer/Desktop/SalesRep`.
-- Branch: `main`.
+- The repaired repository is active at `/Users/nickmeyer/Developer/cpa-planner`.
+- Branch: `phase-2-preview`.
 - Remote: `https://github.com/Create-Kolkai/cpa-planner.git`.
 - The app is a Vite + React + TypeScript single-page app.
-- Phase 2 adds a fetch-based Supabase Auth/REST/RPC adapter because npm dependency installation stalled in this environment.
+- Phase 2 uses a fetch-based Supabase Auth/REST/RPC adapter for a small browser bundle and explicit control over the demo flow.
 - Supabase mode is controlled by `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`.
 - When Supabase is not configured, the app shows an explicit setup state before allowing local prototype mode.
 - The working planner logic is client-side and uses stored pharmacy coordinates plus approximate Haversine scoring.
-- The pharmacy list comes from `public/demo-list.csv`; many coordinates are area-level estimates.
+- The shared pharmacy directory is seeded from the WHF Western Cape July 2024 pharmacy network list.
 - Vercel project metadata exists locally but is ignored and was not deployed.
 
 ## Functional Features Retained
@@ -38,7 +38,7 @@
 - Moving visits and swapping days persist by saving a new plan version.
 - Availability adds/deletes persist to `blocked_dates`.
 - Legacy `cpa-planner-state-v6` data is only imported after an explicit Settings action.
-- XLSX import shows a clear dependency message until the spreadsheet parser package can be installed.
+- XLS/XLSX import is available through a lazy-loaded SheetJS Community Edition parser.
 - Manager/team UI is role-gated in Supabase mode, but full multi-rep event workflow still needs live Supabase testing.
 
 ## UX Changes Made
@@ -51,7 +51,7 @@
 - Pharmacies table uses user-facing pharmacy terminology.
 - Raw latitude/longitude is no longer a primary table column.
 - Availability has its own page for unavailable dates.
-- The fake territory graphic was replaced with an honest map-provider setup state.
+- The fake territory graphic was replaced with a Leaflet/OpenStreetMap territory view.
 
 ## Supabase Foundation
 
@@ -90,9 +90,6 @@ The current app uses approximate route ordering only. It must not show road dist
 
 ## Current Limitations
 
-- Supabase migrations have not been applied locally or remotely because the CLI/project was not available and no remote project was identified.
-- RLS has been statically reviewed but not executed against a live Supabase database.
-- TypeScript 6.0.3 local compiler commands stall before diagnostics in this environment.
-- npm dependency installation for `@supabase/supabase-js`, `xlsx`, and `vitest` also stalled; the implementation uses a typed fetch adapter instead.
-- XLSX import is not functional until a spreadsheet parser is installed.
+- Supabase migrations require application to the confirmed preview/demo project before persistent preview testing.
+- RLS and RPC access have been statically reviewed; live cross-user validation still requires a seeded Supabase preview database.
 - Full manager multi-rep event impact preview and in-app notification interactions require live Supabase validation.

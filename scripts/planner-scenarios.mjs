@@ -143,4 +143,401 @@ function redistributeBlockedDate(plan, blockedDate, laterCapacities) {
   assert.equal(result.visits.filter((visit) => visit.date === "2026-08-21").length, 1);
 }
 
+
+function parseDemoMode(value) {
+  return String(value ?? "false").toLowerCase() === "true";
+}
+
+{
+  assert.equal(parseDemoMode("true"), true);
+  assert.equal(parseDemoMode("TRUE"), true);
+  assert.equal(parseDemoMode("false"), false);
+  assert.equal(parseDemoMode(undefined), false);
+}
+
+function normalizeHeader(value) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function searchMyPharmacies(accounts, query) {
+  const normalized = query.trim().toLowerCase();
+  return accounts.filter((account) => !normalized || [account.name, account.practiceNumber, account.town, account.area, account.address].some((value) => String(value ?? "").toLowerCase().includes(normalized)));
+}
+
+function addDirectoryPharmacy(accounts, directoryRow) {
+  const alreadyAdded = accounts.some((account) => account.directoryPharmacyId === directoryRow.id || account.practiceNumber === directoryRow.practice_number);
+  if (alreadyAdded) return accounts;
+  return accounts.concat({
+    id: `rep-${directoryRow.id}`,
+    directoryPharmacyId: directoryRow.id,
+    practiceNumber: directoryRow.practice_number,
+    name: directoryRow.practice_name,
+    area: directoryRow.suburb || directoryRow.town,
+    town: directoryRow.town,
+    address: directoryRow.physical_address,
+    grade: "B",
+    lat: directoryRow.latitude,
+    lng: directoryRow.longitude,
+    locationPrecision: directoryRow.location_precision,
+  });
+}
+
+function initializeDemoTerritory(accounts, directoryRows) {
+  if (accounts.length) return accounts;
+  return directoryRows.slice(0, 4).map((row, index) => ({
+    id: `demo-${row.id}`,
+    directoryPharmacyId: row.id,
+    practiceNumber: row.practice_number,
+    name: row.practice_name,
+    area: row.suburb || row.town,
+    town: row.town,
+    address: row.physical_address,
+    grade: index % 3 === 0 ? "A" : index % 3 === 1 ? "B" : "C",
+    lat: row.latitude,
+    lng: row.longitude,
+    locationPrecision: row.location_precision,
+  }));
+}
+
+function mapMarkers(accounts) {
+  return accounts.filter((account) => Number.isFinite(account.lat) && Number.isFinite(account.lng)).map((account) => ({
+    id: account.id,
+    label: account.locationPrecision === "town" ? "Approximate town location" : "Located",
+  }));
+}
+
+function areaTotals(accounts, rules) {
+  return Array.from(accounts.reduce((map, account) => {
+    const current = map.get(account.area) ?? { area: account.area, accounts: 0, required: 0 };
+    current.accounts += 1;
+    current.required += rules[account.grade] ?? 0;
+    map.set(account.area, current);
+    return map;
+  }, new Map()).values());
+}
+
+function parseImportRows(rows) {
+  const headers = rows[0].map(normalizeHeader);
+  const find = (...names) => names.map(normalizeHeader).map((name) => headers.indexOf(name)).find((index) => index >= 0) ?? -1;
+  const nameIndex = find("pharmacy name", "practice name", "name", "customer name");
+  const practiceIndex = find("practice number", "customer code", "code");
+  const townIndex = find("town", "city");
+  const suburbIndex = find("suburb", "area");
+  const gradeIndex = find("grade", "current grading");
+  const seen = new Set();
+  let duplicates = 0;
+  const accounts = [];
+  for (const row of rows.slice(1)) {
+    const name = row[nameIndex];
+    if (!name) continue;
+    const key = String(row[practiceIndex] || name).toLowerCase();
+    if (seen.has(key)) {
+      duplicates += 1;
+      continue;
+    }
+    seen.add(key);
+    accounts.push({ name, practiceNumber: row[practiceIndex], town: row[townIndex], area: row[suburbIndex] || row[townIndex], grade: row[gradeIndex] || "C" });
+  }
+  return { accounts, duplicates };
+}
+
+const directoryFixture = [
+  { id: "d1", practice_number: "375861", practice_name: "Cape Town Airport Pharmacy", town: "AIRPORT INDUSTRIA", suburb: "AIRPORT INDUSTRIA", physical_address: "Airport Ring Road", latitude: -33.97, longitude: 18.59, location_precision: "town", active: true },
+  { id: "d2", practice_number: "227951", practice_name: "Vangate Mall Clicks Pharmacy", town: "ATHLONE", suburb: "ATHLONE", physical_address: "Vanguard Drive", latitude: -33.966, longitude: 18.508, location_precision: "town", active: true },
+  { id: "d3", practice_number: "6044859", practice_name: "Durbell Pharmacy", town: "BELLVILLE", suburb: "BELLVILLE", physical_address: "Tygervalley Centre", latitude: -33.899, longitude: 18.626, location_precision: "town", active: true },
+  { id: "d4", practice_number: "513555", practice_name: "Clicks Pharmacy Caledon", town: "CALEDON", suburb: "CALEDON", physical_address: "Victoria Mall", latitude: -34.23, longitude: 19.42, location_precision: "town", active: true },
+];
+
+{
+  const accounts = initializeDemoTerritory([], directoryFixture);
+  assert.equal(searchMyPharmacies(accounts, "vangate").length, 1);
+  assert.equal(searchMyPharmacies(accounts, "227951")[0].name, "Vangate Mall Clicks Pharmacy");
+  assert.equal(searchMyPharmacies(accounts, "athlone").length, 1);
+  assert.equal(searchMyPharmacies(accounts, "CAPE TOWN AIRPORT").length, 1);
+}
+
+{
+  const activeDirectoryRows = directoryFixture.filter((row) => row.active);
+  assert.ok(activeDirectoryRows.some((row) => row.practice_name.includes("Cape Town")));
+  assert.ok(activeDirectoryRows.every((row) => row.active));
+}
+
+{
+  const first = addDirectoryPharmacy([], directoryFixture[0]);
+  const second = addDirectoryPharmacy(first, directoryFixture[0]);
+  assert.equal(first.length, 1);
+  assert.equal(second.length, 1);
+}
+
+{
+  const demo = initializeDemoTerritory([], directoryFixture);
+  const rerun = initializeDemoTerritory(demo, directoryFixture);
+  assert.equal(demo.length, 4);
+  assert.equal(rerun.length, 4);
+  assert.deepEqual(rerun.map((account) => account.practiceNumber), demo.map((account) => account.practiceNumber));
+}
+
+{
+  const accounts = initializeDemoTerritory([], directoryFixture);
+  const markers = mapMarkers(accounts);
+  assert.equal(markers.length, accounts.length);
+  assert.ok(markers.every((marker) => marker.label === "Approximate town location"));
+}
+
+{
+  const totals = areaTotals(initializeDemoTerritory([], directoryFixture), { A: 2, B: 1, C: 0 });
+  assert.equal(totals.reduce((sum, row) => sum + row.accounts, 0), 4);
+  assert.ok(totals.reduce((sum, row) => sum + row.required, 0) > 0);
+}
+
+{
+  const csvRows = [
+    ["Practice Number", "Pharmacy Name", "Town", "Suburb", "Grade"],
+    ["375861", "Cape Town Airport Pharmacy", "CAPE TOWN", "AIRPORT INDUSTRIA", "A"],
+    ["375861", "Cape Town Airport Pharmacy", "CAPE TOWN", "AIRPORT INDUSTRIA", "A"],
+    ["227951", "Vangate Mall Clicks Pharmacy", "CAPE TOWN", "ATHLONE", "B"],
+  ];
+  const parsed = parseImportRows(csvRows);
+  assert.equal(parsed.accounts.length, 2);
+  assert.equal(parsed.duplicates, 1);
+}
+
+{
+  const renderedCopy = "Import pharmacies Territory map Search my pharmacies Approximate town location";
+  assert.equal(renderedCopy.includes("Import CSV"), false);
+  assert.equal(renderedCopy.includes("Map provider not configured"), false);
+  assert.equal(renderedCopy.includes("sales_rep"), false);
+}
+
+function isSessionExpired(expiresAt, nowSeconds, leewaySeconds = 30) {
+  if (!expiresAt) return false;
+  return expiresAt <= nowSeconds + leewaySeconds;
+}
+
+function isExpiredAuthErrorMessage(message) {
+  return /jwt expired|expired jwt|invalid jwt|token.*expired|session.*expired/i.test(String(message ?? ""));
+}
+
+{
+  assert.equal(isSessionExpired(100, 130), true);
+  assert.equal(isSessionExpired(200, 130), false);
+  assert.equal(isSessionExpired(undefined, 130), false);
+  assert.equal(isExpiredAuthErrorMessage("JWT expired"), true);
+  assert.equal(isExpiredAuthErrorMessage("permission denied"), false);
+}
+
+
+function validCoordinate(point) {
+  return Number.isFinite(point?.lat) && Number.isFinite(point?.lng) && Math.abs(point.lat) <= 90 && Math.abs(point.lng) <= 180;
+}
+
+function calculateDistanceKm(a, b) {
+  if (!validCoordinate(a) || !validCoordinate(b)) return null;
+  return distanceKm(a, b);
+}
+
+function activeAssignedCount(accounts) {
+  return new Set(accounts.filter((account) => account.active !== false).map((account) => account.directoryPharmacyId || account.practiceNumber || account.id)).size;
+}
+
+function orderByNearest(items, startPoint) {
+  const remaining = items.slice().sort((a, b) => a.id.localeCompare(b.id));
+  const ordered = [];
+  let current = validCoordinate(startPoint) ? startPoint : remaining.filter(validCoordinate).sort((a, b) => a.lat - b.lat || a.lng - b.lng || a.id.localeCompare(b.id))[0];
+  while (remaining.length) {
+    const best = remaining.map((item, index) => ({ item, index, distance: calculateDistanceKm(current, item) ?? 9999 })).sort((a, b) => a.distance - b.distance || a.item.id.localeCompare(b.item.id))[0];
+    ordered.push(best.item);
+    remaining.splice(best.index, 1);
+    if (validCoordinate(best.item)) current = best.item;
+  }
+  return ordered;
+}
+
+function createToastStore(now = 0) {
+  let notifications = [];
+  return {
+    notify(input) {
+      const duration = input.durationMs ?? ({ success: 5000, info: 5000, warning: 8000, error: null }[input.type]);
+      notifications = [{ ...input, id: String(now), createdAt: now, durationMs: duration }, ...notifications.filter((item) => !input.dedupeKey || item.dedupeKey !== input.dedupeKey)].slice(0, 3);
+    },
+    close(id) {
+      notifications = notifications.filter((item) => item.id !== id);
+    },
+    advance(ms, paused = false) {
+      if (paused) return;
+      now += ms;
+      notifications = notifications.filter((item) => item.durationMs === null || now - item.createdAt < item.durationMs);
+    },
+    clear() {
+      notifications = [];
+    },
+    list() {
+      return notifications;
+    },
+  };
+}
+
+function simpleGeoPlan(accounts, days, max = 8) {
+  const routes = days.map((day) => ({ day, accounts: [] }));
+  accounts.slice().sort((a, b) => b.lat - a.lat || a.name.localeCompare(b.name)).forEach((account) => {
+    const best = routes
+      .filter((route) => route.accounts.length < max)
+      .map((route) => {
+        const span = route.accounts.reduce((largest, existing) => Math.max(largest, calculateDistanceKm(existing, account) ?? 9999), 0);
+        return { route, score: route.accounts.length ? span : 50 };
+      })
+      .filter((candidate) => candidate.score <= 75 || candidate.route.accounts.length === 0)
+      .sort((a, b) => a.score - b.score || b.route.accounts.length - a.route.accounts.length || a.route.day.localeCompare(b.route.day))[0];
+    best?.route.accounts.push(account);
+  });
+  return routes;
+}
+
+{
+  const capeTown = { lat: -33.9249, lng: 18.4241 };
+  const hermanus = { lat: -34.4187, lng: 19.2345 };
+  const km = calculateDistanceKm(capeTown, hermanus);
+  assert.ok(km > 85 && km < 100, `Cape Town to Hermanus expected near 92km, got ${km}`);
+  assert.equal(calculateDistanceKm({ lat: 200, lng: 18 }, capeTown), null);
+  assert.equal(calculateDistanceKm(undefined, capeTown), null);
+}
+
+{
+  const ottery = { id: "ottery", name: "Ottery Pharmacy", lat: -34.0151, lng: 18.5061 };
+  const wynberg = { id: "wynberg", name: "Wynberg Pharmacy", lat: -34.0037, lng: 18.4715 };
+  const hermanus = { id: "hermanus", name: "Hermanus Pharmacy", lat: -34.4187, lng: 19.2345 };
+  const routes = simpleGeoPlan([ottery, wynberg, hermanus], ["2026-08-03", "2026-08-04"], 8);
+  const otteryDay = routes.find((route) => route.accounts.some((account) => account.id === "ottery"));
+  const hermanusDay = routes.find((route) => route.accounts.some((account) => account.id === "hermanus"));
+  assert.notEqual(otteryDay.day, hermanusDay.day);
+  assert.equal(otteryDay.accounts.some((account) => account.id === "wynberg"), true);
+}
+
+{
+  const ordered = orderByNearest([
+    { id: "c", lat: -34.05, lng: 18.5 },
+    { id: "a", lat: -33.93, lng: 18.42 },
+    { id: "b", lat: -33.94, lng: 18.43 },
+  ], { lat: -33.92, lng: 18.42 });
+  assert.deepEqual(ordered.map((item) => item.id), ["a", "b", "c"]);
+}
+
+{
+  const store = createToastStore(1000);
+  store.notify({ type: "success", message: "Imported 326 pharmacies.", dedupeKey: "import" });
+  assert.equal(store.list().length, 1);
+  assert.equal(store.list()[0].durationMs, 5000);
+  store.notify({ type: "success", message: "Imported 326 pharmacies.", dedupeKey: "import" });
+  assert.equal(store.list().length, 1);
+  store.advance(4000, true);
+  assert.equal(store.list().length, 1);
+  store.advance(5001);
+  assert.equal(store.list().length, 0);
+  store.notify({ type: "warning", message: "Review travel." });
+  assert.equal(store.list()[0].durationMs, 8000);
+  store.notify({ type: "error", message: "Could not save." });
+  assert.equal(store.list()[0].durationMs, null);
+  store.close(store.list()[0].id);
+  assert.equal(store.list().some((item) => item.type === "error"), false);
+  store.clear();
+  assert.equal(store.list().length, 0);
+}
+
+{
+  const accounts = [
+    { id: "a", active: true },
+    { id: "b", active: false },
+    { id: "c", practiceNumber: "123", active: true },
+    { id: "d", practiceNumber: "123", active: true },
+    { id: "shared-directory-only", active: false },
+  ];
+  assert.equal(activeAssignedCount(accounts), 2);
+  const searched = accounts.filter((account) => account.id === "a");
+  assert.equal(activeAssignedCount(accounts), 2);
+  assert.equal(searched.length, 1);
+}
+
+
+function loadingSurfaceForWorkspace({ authState, workspaceStatus, monthLoading }) {
+  if (authState === "checking" || workspaceStatus === "loading") return "global-workspace";
+  if (monthLoading) return "calendar-local";
+  return "app-shell";
+}
+
+function applyLatestMonthResponse(state, requestId, response) {
+  if (requestId !== state.latestRequestId) return state;
+  return { ...state, month: response.month, visits: response.visits, monthLoading: false, monthError: "" };
+}
+
+function shouldShowLocationWarning(visits, accountsById) {
+  return visits.some((visit) => {
+    const account = accountsById.get(visit.accountId);
+    if (!account) return false;
+    return account.locationPrecision !== "exact" || !validCoordinate(account);
+  });
+}
+
+function monthErrorState(message) {
+  return { surface: "calendar", message, retryLabel: "Try again", shellVisible: true };
+}
+
+function compactWarningStyle(viewportWidth = 1200) {
+  return {
+    marginX: viewportWidth <= 720 ? 12 : 24,
+    marginY: viewportWidth <= 720 ? 10 : 12,
+    paddingY: 10,
+    paddingX: viewportWidth <= 720 ? 12 : 14,
+    hasIcon: true,
+    wraps: true,
+  };
+}
+
+{
+  assert.equal(loadingSurfaceForWorkspace({ authState: "ready", workspaceStatus: "ready", monthLoading: true }), "calendar-local");
+  assert.notEqual(loadingSurfaceForWorkspace({ authState: "ready", workspaceStatus: "ready", monthLoading: true }), "global-workspace");
+  assert.equal(loadingSurfaceForWorkspace({ authState: "checking", workspaceStatus: "idle", monthLoading: false }), "global-workspace");
+  assert.equal(loadingSurfaceForWorkspace({ authState: "ready", workspaceStatus: "loading", monthLoading: false }), "global-workspace");
+}
+
+{
+  const shell = { sidebarVisible: true, monthlyPlanHeadingVisible: true, selectedMonth: "2026-09", monthLoading: true };
+  assert.equal(shell.sidebarVisible, true);
+  assert.equal(shell.monthlyPlanHeadingVisible, true);
+  assert.equal(shell.selectedMonth, "2026-09");
+}
+
+{
+  const state = { latestRequestId: 2, month: "2026-09", visits: [], monthLoading: true, monthError: "" };
+  const stale = applyLatestMonthResponse(state, 1, { month: "2026-08", visits: [{ id: "old" }] });
+  assert.equal(stale.month, "2026-09");
+  assert.equal(stale.visits.length, 0);
+  const fresh = applyLatestMonthResponse(state, 2, { month: "2026-10", visits: [{ id: "new" }] });
+  assert.equal(fresh.month, "2026-10");
+  assert.equal(fresh.visits[0].id, "new");
+  assert.equal(fresh.monthLoading, false);
+}
+
+{
+  const exactAccounts = new Map([["a", { id: "a", lat: -33.9, lng: 18.4, locationPrecision: "exact" }]]);
+  const approximateAccounts = new Map([["a", { id: "a", lat: -33.9, lng: 18.4, locationPrecision: "town" }]]);
+  const missingAccounts = new Map([["a", { id: "a", locationPrecision: "unknown" }]]);
+  assert.equal(shouldShowLocationWarning([{ accountId: "a" }], exactAccounts), false);
+  assert.equal(shouldShowLocationWarning([{ accountId: "a" }], approximateAccounts), true);
+  assert.equal(shouldShowLocationWarning([{ accountId: "a" }], missingAccounts), true);
+}
+
+{
+  const error = monthErrorState("We couldn’t load this month’s plan. Please try again.");
+  assert.equal(error.surface, "calendar");
+  assert.equal(error.retryLabel, "Try again");
+  assert.equal(error.shellVisible, true);
+  const desktop = compactWarningStyle(1200);
+  const mobile = compactWarningStyle(390);
+  assert.equal(desktop.hasIcon, true);
+  assert.ok(desktop.marginY <= 16);
+  assert.ok(desktop.paddingY <= 12);
+  assert.ok(mobile.marginX <= 12);
+  assert.equal(mobile.wraps, true);
+}
+
 console.log("Planner scenario tests passed");
