@@ -20,8 +20,27 @@ export type AuthCallbackResult =
   | { status: "authenticated"; session: AuthSession }
   | { status: "error"; message: string };
 
+export function isSessionExpired(session: AuthSession | null, leewaySeconds = 30) {
+  if (!session?.expires_at) return false;
+  return session.expires_at <= Math.floor(Date.now() / 1000) + leewaySeconds;
+}
+
+export function clearStoredSession() {
+  storeSession(null);
+}
+
 export function currentSession() {
-  return getStoredSession();
+  const session = getStoredSession();
+  if (isSessionExpired(session)) {
+    clearStoredSession();
+    return null;
+  }
+  return session;
+}
+
+export function isExpiredAuthError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /jwt expired|expired jwt|invalid jwt|token.*expired|session.*expired/i.test(message);
 }
 
 function configuredFallbackRedirectUrl() {

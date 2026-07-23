@@ -309,4 +309,21 @@ const directoryFixture = [
   assert.equal(renderedCopy.includes("sales_rep"), false);
 }
 
+function isSessionExpired(expiresAt, nowSeconds, leewaySeconds = 30) {
+  if (!expiresAt) return false;
+  return expiresAt <= nowSeconds + leewaySeconds;
+}
+
+function isExpiredAuthErrorMessage(message) {
+  return /jwt expired|expired jwt|invalid jwt|token.*expired|session.*expired/i.test(String(message ?? ""));
+}
+
+{
+  assert.equal(isSessionExpired(100, 130), true);
+  assert.equal(isSessionExpired(200, 130), false);
+  assert.equal(isSessionExpired(undefined, 130), false);
+  assert.equal(isExpiredAuthErrorMessage("JWT expired"), true);
+  assert.equal(isExpiredAuthErrorMessage("permission denied"), false);
+}
+
 console.log("Planner scenario tests passed");

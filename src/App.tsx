@@ -18,7 +18,7 @@ import { CircleMarker, MapContainer, Popup, TileLayer, useMap } from "react-leaf
 import { ChangeEvent, Dispatch, SetStateAction, useEffect, useMemo, useState } from "react";
 import { getSupabaseConfig, isDemoMode } from "./lib/supabase/config";
 import type { AuthSession, DirectorySearchRow, ProfileRow, RepPharmacyRow } from "./lib/supabase/types";
-import { currentSession, processAuthCallbackFromUrl, requestPasswordReset, resendSignUpConfirmation, signInWithPassword, signOut, signUpWithPassword } from "./services/auth-service";
+import { clearStoredSession, currentSession, isExpiredAuthError, processAuthCallbackFromUrl, requestPasswordReset, resendSignUpConfirmation, signInWithPassword, signOut, signUpWithPassword } from "./services/auth-service";
 import { deleteBlockedDateByDate, listBlockedDates, upsertBlockedDate } from "./services/availability-service";
 import { confirmCsvImport } from "./services/import-service";
 import { listNotifications } from "./services/notification-service";
@@ -1009,6 +1009,16 @@ function App() {
       });
       setWorkspaceStatus("ready");
     } catch (error) {
+      if (isExpiredAuthError(error)) {
+        clearStoredSession();
+        setSession(null);
+        setProfile(null);
+        setWorkspaceStatus("idle");
+        setWorkspaceError("");
+        setAuthMode("sign-in");
+        setAuthError("Your session expired. Please sign in again.");
+        return;
+      }
       setWorkspaceStatus("error");
       setWorkspaceError(error instanceof Error ? error.message : "Could not load the Supabase workspace.");
     }
