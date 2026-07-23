@@ -1618,7 +1618,7 @@ function App() {
             </div>
           </div>
           {authMode === "check-email" ? (
-            <div className="auth-form">
+            <div className="auth-form auth-form-card">
               <strong>Check your email</strong>
               <span className="muted-copy">We sent a confirmation link to {pendingConfirmationEmail || authForm.email}. Open the link to activate your account.</span>
               {authError && <div className={authError.includes("sent") ? "notice good" : "notice bad"}>{authError}</div>}
@@ -1636,16 +1636,16 @@ function App() {
               </div>
             </div>
           ) : (
-            <div className="auth-form">
-              {authMode === "sign-up" && <label>Full name<input value={authForm.fullName} onChange={(event) => setAuthForm((current) => ({ ...current, fullName: event.target.value }))} /></label>}
-              <label>Email<input type="email" value={authForm.email} onChange={(event) => setAuthForm((current) => ({ ...current, email: event.target.value }))} /></label>
-              {authMode !== "forgot" && <label>Password<input type="password" value={authForm.password} onChange={(event) => setAuthForm((current) => ({ ...current, password: event.target.value }))} /></label>}
+            <div className="auth-form auth-form-card">
+              {authMode === "sign-up" && <label>Full name<input placeholder="Your name" value={authForm.fullName} onChange={(event) => setAuthForm((current) => ({ ...current, fullName: event.target.value }))} /></label>}
+              <label>Email<input type="email" placeholder="name@company.com" value={authForm.email} onChange={(event) => setAuthForm((current) => ({ ...current, email: event.target.value }))} /></label>
+              {authMode !== "forgot" && <label>Password<input type="password" placeholder="Enter password" value={authForm.password} onChange={(event) => setAuthForm((current) => ({ ...current, password: event.target.value }))} /></label>}
               {authError && <div className={authError.includes("requested") ? "notice good" : "notice bad"}>{authError}</div>}
               <button className="button primary full" onClick={handleAuthSubmit} disabled={authBusy}>{authBusy ? "Working..." : authMode === "sign-up" ? "Create account" : authMode === "forgot" ? "Request reset" : "Sign in"}</button>
               <div className="auth-links">
-                <button onClick={() => setAuthMode("sign-in")}>Sign in</button>
-                <button onClick={() => setAuthMode("sign-up")}>Create account</button>
-                <button onClick={() => setAuthMode("forgot")}>Forgot password</button>
+                <button className={authMode === "sign-in" ? "active" : ""} onClick={() => setAuthMode("sign-in")}>Sign in</button>
+                <button className={authMode === "sign-up" ? "active" : ""} onClick={() => setAuthMode("sign-up")}>Create account</button>
+                <button className={authMode === "forgot" ? "active" : ""} onClick={() => setAuthMode("forgot")}>Forgot password</button>
               </div>
             </div>
           )}
