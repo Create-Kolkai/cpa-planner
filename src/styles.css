@@ -87,6 +87,12 @@ body {
   font-size: 12px;
 }
 
+.muted-copy {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
 .notification-badge {
   height: 24px;
   display: inline-flex;

@@ -17,7 +17,7 @@ import {
 import { ChangeEvent, Dispatch, SetStateAction, useEffect, useMemo, useState } from "react";
 import { getSupabaseConfig, isDemoMode } from "./lib/supabase/config";
 import type { AuthSession, ProfileRow, RepPharmacyRow } from "./lib/supabase/types";
-import { currentSession, requestPasswordReset, signInWithPassword, signOut, signUpWithPassword } from "./services/auth-service";
+import { currentSession, processAuthCallbackFromUrl, requestPasswordReset, resendSignUpConfirmation, signInWithPassword, signOut, signUpWithPassword } from "./services/auth-service";
 import { deleteBlockedDateByDate, listBlockedDates, upsertBlockedDate } from "./services/availability-service";
 import { confirmCsvImport } from "./services/import-service";
 import { listNotifications } from "./services/notification-service";
@@ -88,7 +88,8 @@ type ImportNotice = {
   message: string;
 };
 
-type AuthMode = "sign-in" | "sign-up" | "forgot";
+type AuthMode = "sign-in" | "sign-up" | "forgot" | "check-email";
+type AuthInitState = "idle" | "checking" | "ready" | "error";
 
 type WorkspaceLoadState = "idle" | "loading" | "ready" | "error";
 
@@ -736,6 +737,8 @@ function App() {
   const [authForm, setAuthForm] = useState({ email: "", password: "", fullName: "" });
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
+  const [authInitState, setAuthInitState] = useState<AuthInitState>(supabaseConfig.configured ? "checking" : "ready");
+  const [pendingConfirmationEmail, setPendingConfirmationEmail] = useState("");
   const [savedPlanId, setSavedPlanId] = useState<string | null>(null);
   const [notifications, setNotifications] = useState<Array<{ id: string; title: string; body: string; read_at: string | null }>>([]);
   const [allowLocalPrototype, setAllowLocalPrototype] = useState(false);
@@ -747,13 +750,56 @@ function App() {
   }, [state, supabaseConfig.configured]);
 
   useEffect(() => {
+    if (!supabaseConfig.configured) return;
+
+    let active = true;
+    const timeout = window.setTimeout(() => {
+      if (!active) return;
+      setAuthError("Authentication is taking longer than expected. Please try again.");
+      setAuthInitState("error");
+    }, 10000);
+
+    processAuthCallbackFromUrl()
+      .then((result) => {
+        if (!active) return;
+        window.clearTimeout(timeout);
+        if (result.status === "authenticated") {
+          setSession(result.session);
+          setAuthMode("sign-in");
+          setAuthError("");
+          setAuthInitState("ready");
+          return;
+        }
+        if (result.status === "error") {
+          setSession(null);
+          setAuthError(result.message);
+          setAuthInitState("error");
+          return;
+        }
+        setAuthInitState("ready");
+      })
+      .catch((error) => {
+        if (!active) return;
+        window.clearTimeout(timeout);
+        setSession(null);
+        setAuthError(error instanceof Error ? error.message : "Could not initialise authentication.");
+        setAuthInitState("error");
+      });
+
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+    };
+  }, [supabaseConfig.configured]);
+
+  useEffect(() => {
     if (!supabaseConfig.configured && state.accounts.length === 0) loadDemoList("silent");
   }, [state.accounts.length, supabaseConfig.configured]);
 
   useEffect(() => {
-    if (!supabaseConfig.configured || !session?.user.id) return;
+    if (!supabaseConfig.configured || authInitState !== "ready" || !session?.user.id) return;
     loadWorkspace(session);
-  }, [session?.user.id, state.month, supabaseConfig.configured]);
+  }, [authInitState, session?.user.id, state.month, supabaseConfig.configured]);
 
   useEffect(() => {
     const cycleDays = daysInMonth(state.month, state.cycleStartDay);
@@ -866,16 +912,39 @@ function App() {
     setAuthError("");
     try {
       if (authMode === "forgot") {
-        await requestPasswordReset(authForm.email, window.location.origin);
+        await requestPasswordReset(authForm.email);
         setAuthError("Password reset email requested. Check the configured Supabase email settings if it does not arrive.");
       } else {
-        const nextSession = authMode === "sign-up"
-          ? await signUpWithPassword(authForm.email, authForm.password, authForm.fullName)
-          : await signInWithPassword(authForm.email, authForm.password);
+        if (authMode === "sign-up") {
+          const result = await signUpWithPassword(authForm.email, authForm.password, authForm.fullName);
+          if (result.status === "authenticated") {
+            setSession(result.session);
+            return;
+          }
+          setPendingConfirmationEmail(result.email);
+          setAuthMode("check-email");
+          return;
+        }
+        const nextSession = await signInWithPassword(authForm.email, authForm.password);
         setSession(nextSession);
       }
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Authentication failed.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleResendConfirmation() {
+    const email = pendingConfirmationEmail || authForm.email;
+    if (!email) return;
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      await resendSignUpConfirmation(email);
+      setAuthError("Confirmation email sent again. Please check your inbox.");
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Could not resend the confirmation email.");
     } finally {
       setAuthBusy(false);
     }
@@ -1199,6 +1268,32 @@ function App() {
     );
   }
 
+  if (supabaseConfig.configured && authInitState === "checking") {
+    return <div className="auth-shell"><div className="auth-panel"><strong>Checking sign-in...</strong><span>Restoring your CPA Planner session.</span></div></div>;
+  }
+
+  if (supabaseConfig.configured && authInitState === "error") {
+    return (
+      <div className="auth-shell">
+        <div className="auth-panel">
+          <div className="brand inline-brand">
+            <div className="brand-mark">CP</div>
+            <div>
+              <strong>CPA Planner</strong>
+              <span>Authentication problem</span>
+            </div>
+          </div>
+          <div className="notice bad">{authError || "We could not complete the sign-in link. Please try again."}</div>
+          <button className="button secondary full" onClick={() => {
+            setAuthError("");
+            setAuthInitState("ready");
+            setAuthMode("sign-in");
+          }}>Return to sign in</button>
+        </div>
+      </div>
+    );
+  }
+
   if (supabaseConfig.configured && !session) {
     return (
       <div className="auth-shell">
@@ -1207,21 +1302,41 @@ function App() {
             <div className="brand-mark">CP</div>
             <div>
               <strong>CPA Planner</strong>
-              <span>{authMode === "sign-up" ? "Create sales rep account" : authMode === "forgot" ? "Reset password" : "Sign in"}</span>
+              <span>{authMode === "check-email" ? "Confirm account" : authMode === "sign-up" ? "Create sales rep account" : authMode === "forgot" ? "Reset password" : "Sign in"}</span>
             </div>
           </div>
-          <div className="auth-form">
-            {authMode === "sign-up" && <label>Full name<input value={authForm.fullName} onChange={(event) => setAuthForm((current) => ({ ...current, fullName: event.target.value }))} /></label>}
-            <label>Email<input type="email" value={authForm.email} onChange={(event) => setAuthForm((current) => ({ ...current, email: event.target.value }))} /></label>
-            {authMode !== "forgot" && <label>Password<input type="password" value={authForm.password} onChange={(event) => setAuthForm((current) => ({ ...current, password: event.target.value }))} /></label>}
-            {authError && <div className={authError.includes("requested") ? "notice good" : "notice bad"}>{authError}</div>}
-            <button className="button primary full" onClick={handleAuthSubmit} disabled={authBusy}>{authBusy ? "Working..." : authMode === "sign-up" ? "Create account" : authMode === "forgot" ? "Request reset" : "Sign in"}</button>
-            <div className="auth-links">
-              <button onClick={() => setAuthMode("sign-in")}>Sign in</button>
-              <button onClick={() => setAuthMode("sign-up")}>Create account</button>
-              <button onClick={() => setAuthMode("forgot")}>Forgot password</button>
+          {authMode === "check-email" ? (
+            <div className="auth-form">
+              <strong>Check your email</strong>
+              <span className="muted-copy">We sent a confirmation link to {pendingConfirmationEmail || authForm.email}. Open the link to activate your account.</span>
+              {authError && <div className={authError.includes("sent") ? "notice good" : "notice bad"}>{authError}</div>}
+              <button className="button primary full" onClick={handleResendConfirmation} disabled={authBusy}>{authBusy ? "Sending..." : "Resend confirmation email"}</button>
+              <div className="auth-links">
+                <button onClick={() => {
+                  setAuthError("");
+                  setAuthMode("sign-in");
+                }}>Return to sign in</button>
+                <button onClick={() => {
+                  setAuthError("");
+                  setPendingConfirmationEmail("");
+                  setAuthMode("sign-up");
+                }}>Change email</button>
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="auth-form">
+              {authMode === "sign-up" && <label>Full name<input value={authForm.fullName} onChange={(event) => setAuthForm((current) => ({ ...current, fullName: event.target.value }))} /></label>}
+              <label>Email<input type="email" value={authForm.email} onChange={(event) => setAuthForm((current) => ({ ...current, email: event.target.value }))} /></label>
+              {authMode !== "forgot" && <label>Password<input type="password" value={authForm.password} onChange={(event) => setAuthForm((current) => ({ ...current, password: event.target.value }))} /></label>}
+              {authError && <div className={authError.includes("requested") ? "notice good" : "notice bad"}>{authError}</div>}
+              <button className="button primary full" onClick={handleAuthSubmit} disabled={authBusy}>{authBusy ? "Working..." : authMode === "sign-up" ? "Create account" : authMode === "forgot" ? "Request reset" : "Sign in"}</button>
+              <div className="auth-links">
+                <button onClick={() => setAuthMode("sign-in")}>Sign in</button>
+                <button onClick={() => setAuthMode("sign-up")}>Create account</button>
+                <button onClick={() => setAuthMode("forgot")}>Forgot password</button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );
