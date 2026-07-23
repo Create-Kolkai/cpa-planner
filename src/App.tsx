@@ -15,6 +15,15 @@ import {
   Users,
 } from "lucide-react";
 import { ChangeEvent, Dispatch, SetStateAction, useEffect, useMemo, useState } from "react";
+import { getSupabaseConfig, isDemoMode } from "./lib/supabase/config";
+import type { AuthSession, ProfileRow, RepPharmacyRow } from "./lib/supabase/types";
+import { currentSession, requestPasswordReset, signInWithPassword, signOut, signUpWithPassword } from "./services/auth-service";
+import { deleteBlockedDateByDate, listBlockedDates, upsertBlockedDate } from "./services/availability-service";
+import { confirmCsvImport } from "./services/import-service";
+import { listNotifications } from "./services/notification-service";
+import { loadLatestMonthlyPlan, saveMonthlyPlan } from "./services/planning-service";
+import { getProfile } from "./services/profile-service";
+import { listRepPharmacies } from "./services/pharmacy-service";
 
 type TabKey = "overview" | "pharmacies" | "monthly-plan" | "availability" | "team" | "settings";
 type GradeRules = Record<string, number>;
@@ -78,6 +87,10 @@ type ImportNotice = {
   tone: "good" | "bad" | "warn";
   message: string;
 };
+
+type AuthMode = "sign-in" | "sign-up" | "forgot";
+
+type WorkspaceLoadState = "idle" | "loading" | "ready" | "error";
 
 const STORAGE_KEY = "cpa-planner-state-v6";
 const DEMO_LIST_URL = "/demo-list.csv";
@@ -169,6 +182,98 @@ function loadState(): PersistedState {
   } catch {
     return fallback;
   }
+}
+
+function accountFromPharmacyRow(row: RepPharmacyRow): Account {
+  return {
+    id: row.id,
+    name: row.pharmacy_name,
+    address: row.address ?? [row.suburb, row.town, row.province].filter(Boolean).join(", "),
+    area: row.suburb ?? row.town ?? "Unassigned",
+    grade: row.grade,
+    lat: row.latitude ?? undefined,
+    lng: row.longitude ?? undefined,
+    coordinateSource: row.source,
+    coordinateConfidence: row.location_quality === "area_estimate" ? "Area-level" : row.location_quality === "unresolved" ? "Needs review" : "Located",
+    coordinateMatch: row.directory_pharmacy_id ? "Directory match" : "Representative record",
+  };
+}
+
+function defaultStateForMonth(): PersistedState {
+  return {
+    accounts: [],
+    gradeRules: defaultRules,
+    nonFieldDays: [],
+    visits: [],
+    month: getInitialMonth(),
+    dailyCapacity: 8,
+    minDailyCalls: 4,
+    cycleStartDay: 1,
+    routeStartAddress: "",
+    routeStartLat: undefined,
+    routeStartLng: undefined,
+    managerNotice: "",
+    managerTrainingDate: `${getInitialMonth()}-18`,
+    managerPlanningDueDays: 7,
+  };
+}
+
+function stateFromSupabase(defaults: PersistedState, pharmacyRows: RepPharmacyRow[], blockedRows: Array<{ date: string; reason: string; type: string }>): PersistedState {
+  return {
+    ...defaults,
+    accounts: pharmacyRows.map(accountFromPharmacyRow),
+    nonFieldDays: blockedRows.map((day) => ({
+      date: day.date,
+      reason: day.reason,
+      type: fromBlockedType(day.type),
+    })),
+  };
+}
+
+function fromBlockedType(value: string): NonFieldDay["type"] {
+  const map: Record<string, NonFieldDay["type"]> = {
+    training: "Training",
+    meeting: "Meeting",
+    leave: "Leave",
+    conference: "Travel",
+    public_holiday: "Holiday",
+    other: "Travel",
+  };
+  return map[value] ?? "Travel";
+}
+
+function toBlockedType(value: NonFieldDay["type"]) {
+  const map: Record<NonFieldDay["type"], "training" | "meeting" | "leave" | "conference" | "public_holiday" | "other"> = {
+    Training: "training",
+    Meeting: "meeting",
+    Leave: "leave",
+    Holiday: "public_holiday",
+    Travel: "conference",
+    Sick: "other",
+  };
+  return map[value];
+}
+
+function occurrenceNumberFromVisit(visit: Visit) {
+  const match = visit.id.match(/-(\d+)-\d{4}-\d{2}-\d{2}$/);
+  return match ? Number(match[1]) : 1;
+}
+
+function pharmacyInputFromAccount(account: Account) {
+  return {
+    id: account.id.startsWith("csv-") || account.id.startsWith("ACT") || account.id.startsWith("O") ? undefined : account.id,
+    practiceNumber: account.id.startsWith("csv-") ? undefined : account.id,
+    name: account.name,
+    address: account.address,
+    suburb: account.area,
+    province: "WESTERN CAPE",
+    lat: account.lat,
+    lng: account.lng,
+    locationQuality: account.lat !== undefined && account.lng !== undefined ? "area_estimate" as const : "unresolved" as const,
+    grade: account.grade,
+    source: "import",
+    active: true,
+  };
 }
 
 function dateKey(date: Date) {
@@ -615,20 +720,40 @@ function exportCalendarCsv(visits: Visit[], accounts: Account[], days: string[],
 }
 
 function App() {
-  const [state, setState] = useState<PersistedState>(loadState);
+  const supabaseConfig = getSupabaseConfig();
+  const demoMode = isDemoMode();
+  const [state, setState] = useState<PersistedState>(() => (supabaseConfig.configured ? defaultStateForMonth() : loadState()));
   const [activeTab, setActiveTab] = useState<TabKey>("overview");
   const [importNotice, setImportNotice] = useState<ImportNotice | null>(null);
   const [selectedDay, setSelectedDay] = useState<string>("");
   const [swapTargetDay, setSwapTargetDay] = useState<string>("");
   const [newNonField, setNewNonField] = useState({ date: `${state.month}-15`, type: "Leave" as NonFieldDay["type"], reason: "" });
+  const [session, setSession] = useState<AuthSession | null>(() => (supabaseConfig.configured ? currentSession() : null));
+  const [profile, setProfile] = useState<ProfileRow | null>(null);
+  const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceLoadState>(supabaseConfig.configured && session ? "loading" : "idle");
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [authMode, setAuthMode] = useState<AuthMode>("sign-in");
+  const [authForm, setAuthForm] = useState({ email: "", password: "", fullName: "" });
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [savedPlanId, setSavedPlanId] = useState<string | null>(null);
+  const [notifications, setNotifications] = useState<Array<{ id: string; title: string; body: string; read_at: string | null }>>([]);
+  const [allowLocalPrototype, setAllowLocalPrototype] = useState(false);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  }, [state]);
+    if (!supabaseConfig.configured) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    }
+  }, [state, supabaseConfig.configured]);
 
   useEffect(() => {
-    if (state.accounts.length === 0) loadDemoList("silent");
-  }, [state.accounts.length]);
+    if (!supabaseConfig.configured && state.accounts.length === 0) loadDemoList("silent");
+  }, [state.accounts.length, supabaseConfig.configured]);
+
+  useEffect(() => {
+    if (!supabaseConfig.configured || !session?.user.id) return;
+    loadWorkspace(session);
+  }, [session?.user.id, state.month, supabaseConfig.configured]);
 
   useEffect(() => {
     const cycleDays = daysInMonth(state.month, state.cycleStartDay);
@@ -693,14 +818,164 @@ function App() {
     { key: "team", label: "Team", icon: Users },
     { key: "settings", label: "Settings", icon: Settings2 },
   ];
+  const visibleTabs = tabs.filter((tab) => !supabaseConfig.configured || tab.key !== "team" || profile?.role === "manager" || profile?.role === "admin");
 
   function updateRule(grade: string, value: number) {
     setState((current) => ({ ...current, gradeRules: { ...current.gradeRules, [grade]: value } }));
   }
 
+  async function loadWorkspace(activeSession: AuthSession) {
+    setWorkspaceStatus("loading");
+    setWorkspaceError("");
+    try {
+      const userProfile = await getProfile(activeSession.user.id);
+      const [pharmacyRows, blockedRows, loadedPlan, userNotifications] = await Promise.all([
+        listRepPharmacies(activeSession.user.id),
+        listBlockedDates(activeSession.user.id, state.month),
+        loadLatestMonthlyPlan(activeSession.user.id, state.month),
+        listNotifications(activeSession.user.id).catch(() => []),
+      ]);
+      setProfile(userProfile);
+      setNotifications(userNotifications.map((item) => ({ id: item.id, title: item.title, body: item.body, read_at: item.read_at })));
+      setSavedPlanId(loadedPlan?.plan.id ?? null);
+      setState((current) => {
+        const next = stateFromSupabase(current, pharmacyRows, blockedRows);
+        if (!loadedPlan) return { ...next, visits: [] };
+        const dayById = new Map(loadedPlan.days.map((day) => [day.id, day.date]));
+        return {
+          ...next,
+          visits: loadedPlan.visits
+            .filter((visit) => visit.status === "scheduled" && visit.plan_day_id)
+            .map((visit) => ({
+              id: visit.id,
+              accountId: visit.rep_pharmacy_id,
+              date: dayById.get(visit.plan_day_id!) ?? state.month,
+              locked: visit.manually_moved,
+            })),
+        };
+      });
+      setWorkspaceStatus("ready");
+    } catch (error) {
+      setWorkspaceStatus("error");
+      setWorkspaceError(error instanceof Error ? error.message : "Could not load the Supabase workspace.");
+    }
+  }
+
+  async function handleAuthSubmit() {
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      if (authMode === "forgot") {
+        await requestPasswordReset(authForm.email, window.location.origin);
+        setAuthError("Password reset email requested. Check the configured Supabase email settings if it does not arrive.");
+      } else {
+        const nextSession = authMode === "sign-up"
+          ? await signUpWithPassword(authForm.email, authForm.password, authForm.fullName)
+          : await signInWithPassword(authForm.email, authForm.password);
+        setSession(nextSession);
+      }
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Authentication failed.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleSignOut() {
+    await signOut();
+    setSession(null);
+    setProfile(null);
+    setWorkspaceStatus("idle");
+    setState(defaultStateForMonth());
+  }
+
+  async function persistCurrentPlan(reason: string, nextVisits = state.visits) {
+    if (!supabaseConfig.configured || !session?.user.id) return;
+    const byDay = new Map<string, Visit[]>();
+    nextVisits.forEach((visit) => {
+      const rows = byDay.get(visit.date) ?? [];
+      rows.push(visit);
+      byDay.set(visit.date, rows);
+    });
+    const planId = await saveMonthlyPlan({
+      month: state.month,
+      status: metrics.required > nextVisits.length ? "unresolved" : "review",
+      generationMode: "approximate",
+      settingsSnapshot: {
+        gradeRules: state.gradeRules,
+        dailyCapacity: state.dailyCapacity,
+        minDailyCalls: state.minDailyCalls,
+        cycleStartDay: state.cycleStartDay,
+        routeStartAddress: state.routeStartAddress,
+      },
+      requiredVisitCount: metrics.required,
+      scheduledVisitCount: nextVisits.length,
+      unresolvedVisitCount: Math.max(0, metrics.required - nextVisits.length),
+      availableCapacity: metrics.capacity,
+      days: allDays.map((day) => {
+        const dayVisits = byDay.get(day) ?? [];
+        const primaryArea = Array.from(new Set(dayVisits.map((visit) => accountById.get(visit.accountId)?.area).filter(Boolean))).join(", ");
+        return {
+          date: day,
+          locked: dayVisits.some((visit) => visit.locked),
+          manuallyModified: dayVisits.some((visit) => visit.locked),
+          primaryArea,
+          visitCount: dayVisits.length,
+          routeMode: "approximate",
+        };
+      }),
+      visits: nextVisits.map((visit, index) => ({
+        repPharmacyId: visit.accountId,
+        occurrenceNumber: occurrenceNumberFromVisit(visit),
+        date: visit.date,
+        stopOrder: index + 1,
+        status: "scheduled",
+        manuallyMoved: Boolean(visit.locked),
+      })),
+      reason,
+    });
+    setSavedPlanId(planId);
+  }
+
+  async function importLegacyLocalState() {
+    if (!session?.user.id) return;
+    const legacy = loadState();
+    if (!legacy.accounts.length) {
+      setImportNotice({ tone: "warn", message: "No legacy browser demo pharmacies were found." });
+      return;
+    }
+    try {
+      const rows = await confirmCsvImport(session.user.id, "legacy browser demo state", legacy.accounts.map(pharmacyInputFromAccount), {
+        totalRows: legacy.accounts.length,
+        validRows: legacy.accounts.length,
+        matchedRows: 0,
+        unmatchedRows: legacy.accounts.length,
+        duplicateRows: 0,
+        errorRows: 0,
+      });
+      await Promise.all(legacy.nonFieldDays.map((day) => upsertBlockedDate({
+        repId: session.user.id,
+        date: day.date,
+        type: toBlockedType(day.type),
+        reason: day.reason,
+        createdBy: session.user.id,
+        source: "legacy",
+      })));
+      setState((current) => ({ ...current, accounts: rows.map(accountFromPharmacyRow), nonFieldDays: legacy.nonFieldDays, visits: [] }));
+      setImportNotice({ tone: "good", message: `Imported ${rows.length} legacy pharmacies and ${legacy.nonFieldDays.length} unavailable dates into your Supabase workspace.` });
+    } catch (error) {
+      setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Legacy migration failed." });
+    }
+  }
+
   function handleImport(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
+    if (/\.(xlsx|xls)$/i.test(file.name)) {
+      setImportNotice({ tone: "warn", message: "XLSX import workflow is prepared, but the spreadsheet parser dependency could not be installed in this environment. Export the sheet to CSV for this build." });
+      event.target.value = "";
+      return;
+    }
     file.text().then((text) => {
       importAccounts(text, file.name, "interactive");
     }).catch(() => {
@@ -719,12 +994,34 @@ function App() {
       });
       setState((current) => ({ ...current, accounts: result.accounts, gradeRules: nextRules, visits: [] }));
       setSelectedDay("");
+      if (supabaseConfig.configured && session?.user.id && mode === "interactive") {
+        confirmCsvImport(session.user.id, sourceName, result.accounts.map(pharmacyInputFromAccount), {
+          totalRows: result.accounts.length + result.warnings.length,
+          validRows: result.accounts.length,
+          matchedRows: 0,
+          unmatchedRows: result.accounts.length,
+          duplicateRows: 0,
+          errorRows: 0,
+        })
+          .then((rows) => {
+            setState((current) => ({ ...current, accounts: rows.map(accountFromPharmacyRow), visits: [] }));
+            setImportNotice({
+              tone: result.warnings.length ? "warn" : "good",
+              message: `Imported and saved ${rows.length} pharmacies from ${sourceName}.${result.warnings.length ? ` ${result.warnings.join(" ")}` : ""}`,
+            });
+          })
+          .catch((error) => {
+            setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Import could not be saved to Supabase." });
+          });
+      }
       if (mode === "interactive") {
         setActiveTab("pharmacies");
-        setImportNotice({
-          tone: result.warnings.length ? "warn" : "good",
-          message: `Imported ${result.accounts.length} pharmacies from ${sourceName}.${result.warnings.length ? ` ${result.warnings.join(" ")}` : ""}`,
-        });
+        if (!supabaseConfig.configured || !session?.user.id) {
+          setImportNotice({
+            tone: result.warnings.length ? "warn" : "good",
+            message: `Imported ${result.accounts.length} pharmacies into local prototype mode from ${sourceName}.${result.warnings.length ? ` ${result.warnings.join(" ")}` : ""}`,
+          });
+        }
       }
     } else {
       setImportNotice({ tone: "bad", message: `Import failed: ${result.warnings.join(" ")}` });
@@ -748,6 +1045,17 @@ function App() {
 
   function addNonFieldDay() {
     if (!newNonField.date || !newNonField.reason.trim()) return;
+    if (supabaseConfig.configured && session?.user.id) {
+      upsertBlockedDate({
+        repId: session.user.id,
+        date: newNonField.date,
+        type: toBlockedType(newNonField.type),
+        reason: newNonField.reason.trim(),
+        createdBy: session.user.id,
+      }).catch((error) => {
+        setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Unavailable date could not be saved." });
+      });
+    }
     setState((current) => ({
       ...current,
       nonFieldDays: [...current.nonFieldDays.filter((day) => day.date !== newNonField.date), { ...newNonField, reason: newNonField.reason.trim() }],
@@ -756,11 +1064,26 @@ function App() {
     setNewNonField((current) => ({ ...current, reason: "" }));
   }
 
+  function removeUnavailableDate(date: string) {
+    if (supabaseConfig.configured && session?.user.id) {
+      deleteBlockedDateByDate(session.user.id, date).catch((error) => {
+        setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Unavailable date could not be deleted." });
+      });
+    }
+    setState((current) => ({
+      ...current,
+      nonFieldDays: current.nonFieldDays.filter((item) => item.date !== date),
+      visits: current.visits.filter((visit) => visit.date !== date),
+    }));
+  }
+
   function moveVisit(visitId: string, date: string) {
+    const nextVisits = state.visits.map((visit) => (visit.id === visitId ? { ...visit, date, locked: true } : visit));
     setState((current) => ({
       ...current,
       visits: current.visits.map((visit) => (visit.id === visitId ? { ...visit, date, locked: true } : visit)),
     }));
+    persistCurrentPlan("move visit", nextVisits).catch((error) => setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Visit move could not be saved." }));
   }
 
   function removeVisit(visitId: string) {
@@ -769,6 +1092,11 @@ function App() {
 
   function swapDayCalls(sourceDay: string, targetDay: string) {
     if (!sourceDay || !targetDay || sourceDay === targetDay) return;
+    const nextVisits = state.visits.map((visit) => {
+      if (visit.date === sourceDay) return { ...visit, date: targetDay, locked: true };
+      if (visit.date === targetDay) return { ...visit, date: sourceDay, locked: true };
+      return visit;
+    });
     setState((current) => ({
       ...current,
       visits: current.visits.map((visit) => {
@@ -779,6 +1107,7 @@ function App() {
     }));
     setSelectedDay(targetDay);
     setSwapTargetDay("");
+    persistCurrentPlan("swap day", nextVisits).catch((error) => setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Day swap could not be saved." }));
   }
 
   function regenerateFromDate(changeDate: string, nextNonFieldDays = state.nonFieldDays) {
@@ -815,20 +1144,26 @@ function App() {
   }
 
   function generate() {
+    const nextVisits = generatePlan(
+      state.accounts,
+      state.gradeRules,
+      state.month,
+      state.nonFieldDays,
+      state.dailyCapacity,
+      state.minDailyCalls,
+      state.cycleStartDay,
+      { lat: state.routeStartLat, lng: state.routeStartLng },
+    );
     setState((current) => ({
       ...current,
-      visits: generatePlan(
-        current.accounts,
-        current.gradeRules,
-        current.month,
-        current.nonFieldDays,
-        current.dailyCapacity,
-        current.minDailyCalls,
-        current.cycleStartDay,
-        { lat: current.routeStartLat, lng: current.routeStartLng },
-      ),
+      visits: nextVisits,
     }));
     setImportNotice({ tone: "good", message: "Plan generated from the current pharmacies, grade rules, and unavailable dates." });
+    persistCurrentPlan("generate plan", nextVisits)
+      .then(() => {
+        if (supabaseConfig.configured) setImportNotice({ tone: "good", message: "Plan generated and saved to Supabase." });
+      })
+      .catch((error) => setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Plan generated but could not be saved." }));
   }
 
   function addManagerTrainingDay() {
@@ -839,6 +1174,74 @@ function App() {
     ];
     regenerateFromDate(state.managerTrainingDate, nextNonFieldDays);
     setImportNotice({ tone: "warn", message: `Team event added on ${state.managerTrainingDate}. Future visits were recalculated from that date only.` });
+  }
+
+  if (!supabaseConfig.configured && !allowLocalPrototype) {
+    return (
+      <div className="auth-shell">
+        <div className="auth-panel">
+          <div className="brand inline-brand">
+            <div className="brand-mark">CP</div>
+            <div>
+              <strong>CPA Planner</strong>
+              <span>Supabase setup required</span>
+            </div>
+          </div>
+          <div className="notice warn">Persistent demo mode needs `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`. The app will not silently store pharmacy lists or plans in browser storage when Supabase mode is expected.</div>
+          <div className="setup-list">
+            <span>1. Apply the Supabase migrations to the confirmed demo project.</span>
+            <span>2. Add the client-safe environment variables from `.env.example`.</span>
+            <span>3. Restart the Vite dev server.</span>
+          </div>
+          <button className="button secondary" onClick={() => setAllowLocalPrototype(true)}>Open local prototype mode</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (supabaseConfig.configured && !session) {
+    return (
+      <div className="auth-shell">
+        <div className="auth-panel">
+          <div className="brand inline-brand">
+            <div className="brand-mark">CP</div>
+            <div>
+              <strong>CPA Planner</strong>
+              <span>{authMode === "sign-up" ? "Create sales rep account" : authMode === "forgot" ? "Reset password" : "Sign in"}</span>
+            </div>
+          </div>
+          <div className="auth-form">
+            {authMode === "sign-up" && <label>Full name<input value={authForm.fullName} onChange={(event) => setAuthForm((current) => ({ ...current, fullName: event.target.value }))} /></label>}
+            <label>Email<input type="email" value={authForm.email} onChange={(event) => setAuthForm((current) => ({ ...current, email: event.target.value }))} /></label>
+            {authMode !== "forgot" && <label>Password<input type="password" value={authForm.password} onChange={(event) => setAuthForm((current) => ({ ...current, password: event.target.value }))} /></label>}
+            {authError && <div className={authError.includes("requested") ? "notice good" : "notice bad"}>{authError}</div>}
+            <button className="button primary full" onClick={handleAuthSubmit} disabled={authBusy}>{authBusy ? "Working..." : authMode === "sign-up" ? "Create account" : authMode === "forgot" ? "Request reset" : "Sign in"}</button>
+            <div className="auth-links">
+              <button onClick={() => setAuthMode("sign-in")}>Sign in</button>
+              <button onClick={() => setAuthMode("sign-up")}>Create account</button>
+              <button onClick={() => setAuthMode("forgot")}>Forgot password</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (supabaseConfig.configured && workspaceStatus === "loading") {
+    return <div className="auth-shell"><div className="auth-panel"><strong>Loading workspace...</strong><span>Restoring your Supabase session and planner data.</span></div></div>;
+  }
+
+  if (supabaseConfig.configured && workspaceStatus === "error") {
+    return (
+      <div className="auth-shell">
+        <div className="auth-panel">
+          <strong>Could not load workspace</strong>
+          <div className="notice bad">{workspaceError}</div>
+          <button className="button secondary" onClick={() => session && loadWorkspace(session)}>Retry</button>
+          <button className="button secondary" onClick={handleSignOut}>Sign out</button>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -852,7 +1255,7 @@ function App() {
           </div>
         </div>
         <nav>
-          {tabs.map((tab) => {
+          {visibleTabs.map((tab) => {
             const Icon = tab.icon;
             return (
               <button key={tab.key} className={activeTab === tab.key ? "active" : ""} onClick={() => setActiveTab(tab.key)}>
@@ -866,14 +1269,15 @@ function App() {
       <main className="workspace">
         <header className="topbar">
           <div>
-            <h1>{tabs.find((tab) => tab.key === activeTab)?.label ?? "CPA Planner"}</h1>
-            <p>Persistent monthly visit planning demo · approximate route ordering until a route provider is configured</p>
+            <h1>{visibleTabs.find((tab) => tab.key === activeTab)?.label ?? "CPA Planner"}</h1>
+            <p>{supabaseConfig.configured ? `${profile?.email ?? session?.user.email ?? "Signed in"} · ${profile?.role ?? "profile"}` : "Local prototype mode · not persistent across devices"} · approximate route ordering</p>
           </div>
           <div className="actions">
+            {notifications.filter((item) => !item.read_at).length > 0 && <span className="notification-badge">{notifications.filter((item) => !item.read_at).length} unread</span>}
             {activeTab === "pharmacies" && (
               <label className="button secondary" title="Import CSV">
                 <FileUp size={16} /> Import CSV
-                <input type="file" accept=".csv,.txt" onChange={handleImport} />
+                <input type="file" accept=".csv,.txt,.xlsx,.xls" onChange={handleImport} />
               </label>
             )}
             {activeTab === "monthly-plan" && state.visits.length > 0 && (
@@ -882,6 +1286,7 @@ function App() {
             {activeTab === "monthly-plan" && (
               <button className="button primary" onClick={generate}><Play size={16} /> {state.visits.length ? "Replan" : "Generate plan"}</button>
             )}
+            {supabaseConfig.configured && <button className="button secondary" onClick={handleSignOut}>Sign out</button>}
           </div>
         </header>
 
@@ -1087,11 +1492,7 @@ function App() {
                   <span>{day.date}</span>
                   <strong>{day.type}</strong>
                   <em>{day.reason}</em>
-                  <button className="icon-button" onClick={() => setState((current) => ({
-                    ...current,
-                    nonFieldDays: current.nonFieldDays.filter((item) => item.date !== day.date),
-                    visits: current.visits.filter((visit) => visit.date !== day.date),
-                  }))}><Trash2 size={14} /></button>
+                  <button className="icon-button" onClick={() => removeUnavailableDate(day.date)}><Trash2 size={14} /></button>
                 </div>
               ))}
             </div>
@@ -1109,7 +1510,7 @@ function App() {
                 <div className="actions">
                   <label className="button secondary" title="Import CSV">
                     <FileUp size={16} /> Import CSV
-                    <input type="file" accept=".csv,.txt" onChange={handleImport} />
+                    <input type="file" accept=".csv,.txt,.xlsx,.xls" onChange={handleImport} />
                   </label>
                 </div>
               </div>
@@ -1204,11 +1605,7 @@ function App() {
                     <span>{day.date}</span>
                     <strong>{day.type}</strong>
                     <em>{day.reason}</em>
-                    <button className="icon-button" onClick={() => setState((current) => ({
-                      ...current,
-                      nonFieldDays: current.nonFieldDays.filter((item) => item.date !== day.date),
-                      visits: current.visits.filter((visit) => visit.date !== day.date),
-                    }))}><Trash2 size={14} /></button>
+                    <button className="icon-button" onClick={() => removeUnavailableDate(day.date)}><Trash2 size={14} /></button>
                   </div>
                 ))}
               </div>
@@ -1225,6 +1622,12 @@ function App() {
                   <span>Frequency, capacity, route start, and demo workspace controls.</span>
                 </div>
               </div>
+              {supabaseConfig.configured && (
+                <div className="demo-tools">
+                  <button className="button secondary" onClick={importLegacyLocalState}>Import existing browser demo data</button>
+                  {demoMode && <button className="button secondary" onClick={resetSample}>Load demo pharmacies locally</button>}
+                </div>
+              )}
               <RulesEditor
                 gradeRules={state.gradeRules}
                 nonFieldDays={state.nonFieldDays}
@@ -1240,11 +1643,7 @@ function App() {
                 updatePlannerSettings={(patch) => setState((current) => ({ ...current, ...patch, visits: patch.cycleStartDay !== undefined ? [] : current.visits }))}
                 addNonFieldDay={addNonFieldDay}
                 resetSample={resetSample}
-                removeNonFieldDay={(date) => setState((current) => ({
-                  ...current,
-                  nonFieldDays: current.nonFieldDays.filter((item) => item.date !== date),
-                  visits: current.visits.filter((visit) => visit.date !== date),
-                }))}
+                removeNonFieldDay={removeUnavailableDate}
               />
             </div>
           </section>

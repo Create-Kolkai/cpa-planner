@@ -26,3 +26,21 @@ If the PDF is not present, do not fabricate the full directory. Use existing dem
 10. Upsert idempotently by practice number or stable source hash.
 
 Representatives should only search verified active records through the restricted RPC.
+
+## Demo Seed Script
+
+Phase 2 adds:
+
+`scripts/import-pharmacy-directory.mjs`
+
+It can seed the directory from `public/demo-list.csv` or a reviewed generated CSV while preserving practice numbers and using a stable source hash.
+
+Run only in a server/local environment with a confirmed non-production project:
+
+```bash
+VITE_SUPABASE_URL="https://<project>.supabase.co" \
+SUPABASE_SERVICE_ROLE_KEY="<server-only-key>" \
+node scripts/import-pharmacy-directory.mjs public/demo-list.csv
+```
+
+The script must never be imported into browser code.

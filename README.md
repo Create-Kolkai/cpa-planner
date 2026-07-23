@@ -6,12 +6,16 @@ CPA Planner is a demo application for pharmaceutical sales representatives plann
 
 - Vite + React + TypeScript.
 - Compact planning UI.
-- CSV pharmacy import.
+- Supabase-configured sign-in flow.
+- Supabase service layer for profiles, pharmacies, availability, plans and notifications.
+- CSV pharmacy import with persistent upsert when signed in.
 - Approximate route grouping.
 - Calendar editing.
 - Availability management.
-- Team readiness concept.
+- Role-aware Team navigation.
 - Supabase foundation migration and setup docs.
+
+Repository: `https://github.com/Create-Kolkai/cpa-planner.git`
 
 ## Local Setup
 
@@ -28,6 +32,8 @@ npm run typecheck
 npm run test
 npm run build
 ```
+
+Note: in the current local environment, TypeScript and Vite commands may stall before diagnostics with TypeScript `6.0.3`; do not mark them passed unless they complete.
 
 ## Supabase
 

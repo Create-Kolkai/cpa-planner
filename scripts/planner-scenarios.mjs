@@ -79,6 +79,32 @@ function assertNoOverload(days, max) {
   days.forEach((day) => assert.ok(day.length <= max, `day has ${day.length}, max ${max}`));
 }
 
+function swapDays(plan, sourceDate, targetDate) {
+  return plan.map((visit) => {
+    if (visit.date === sourceDate) return { ...visit, date: targetDate };
+    if (visit.date === targetDate) return { ...visit, date: sourceDate };
+    return visit;
+  });
+}
+
+function redistributeBlockedDate(plan, blockedDate, laterCapacities) {
+  const displaced = plan.filter((visit) => visit.date === blockedDate);
+  const preserved = plan.filter((visit) => visit.date !== blockedDate);
+  const unresolved = [];
+  let cursor = 0;
+  const moved = [];
+  for (const [date, capacity] of laterCapacities) {
+    const existing = preserved.filter((visit) => visit.date === date).length + moved.filter((visit) => visit.date === date).length;
+    const available = Math.max(0, capacity - existing);
+    displaced.slice(cursor, cursor + available).forEach((visit, index) => {
+      moved.push({ ...visit, date, stopOrder: existing + index + 1 });
+    });
+    cursor += available;
+  }
+  unresolved.push(...displaced.slice(cursor).map((visit) => ({ ...visit, status: "unresolved" })));
+  return { visits: [...preserved, ...moved], unresolved };
+}
+
 {
   const days = planByNearbyOverflow([...makeVisits("SEA POINT", 10), ...makeVisits("GREEN POINT", 6)], 8);
   assert.equal(days.flat().length, 16);
@@ -93,6 +119,28 @@ function assertNoOverload(days, max) {
   assertNoOverload(days, 8);
   assert.equal(days.filter((day) => day.length === 8).length, 2);
   assert.ok(days.some((day) => areaCounts(day)["SEA POINT"] === 2 && areaCounts(day)["GREEN POINT"] === 3));
+}
+
+{
+  const plan = [
+    { id: "a", date: "2026-08-04" },
+    { id: "b", date: "2026-08-04" },
+    { id: "c", date: "2026-08-07" },
+  ];
+  const swapped = swapDays(plan, "2026-08-04", "2026-08-07");
+  assert.deepEqual(swapped.filter((visit) => visit.date === "2026-08-07").map((visit) => visit.id).sort(), ["a", "b"]);
+  assert.deepEqual(swapped.filter((visit) => visit.date === "2026-08-04").map((visit) => visit.id), ["c"]);
+}
+
+{
+  const displaced = Array.from({ length: 6 }, (_, index) => ({ id: `blocked-${index + 1}`, date: "2026-08-18", status: "scheduled" }));
+  const result = redistributeBlockedDate(displaced, "2026-08-18", [["2026-08-19", 2], ["2026-08-20", 3], ["2026-08-21", 1]]);
+  assert.equal(result.visits.filter((visit) => visit.date === "2026-08-18").length, 0);
+  assert.equal(result.visits.length, 6);
+  assert.equal(result.unresolved.length, 0);
+  assert.equal(result.visits.filter((visit) => visit.date === "2026-08-19").length, 2);
+  assert.equal(result.visits.filter((visit) => visit.date === "2026-08-20").length, 3);
+  assert.equal(result.visits.filter((visit) => visit.date === "2026-08-21").length, 1);
 }
 
 console.log("Planner scenario tests passed");

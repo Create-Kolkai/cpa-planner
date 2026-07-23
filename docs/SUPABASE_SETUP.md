@@ -30,7 +30,16 @@ supabase link --project-ref <demo-project-ref>
 supabase db push
 ```
 
-The first migration creates tables, indexes, triggers, RLS policies, and a restricted directory search RPC.
+The migrations create tables, indexes, triggers, RLS policies, a restricted directory search RPC and a transactional `save_monthly_plan` RPC.
+
+Local validation commands once Supabase CLI is installed:
+
+```bash
+npx supabase --version
+npx supabase start
+npx supabase db reset
+npx supabase status
+```
 
 ## Auth
 
@@ -42,6 +51,8 @@ Enable email/password auth in Supabase. Add callback URLs for:
 
 New users receive a `sales_rep` profile by default. Promote managers/admins directly in the database or with a server-only admin tool.
 
+The browser app uses Supabase Auth endpoints directly through a typed fetch adapter. It does not use or expose `SUPABASE_SERVICE_ROLE_KEY`.
+
 ## RLS Verification
 
 Verify:
@@ -50,3 +61,4 @@ Verify:
 - A manager can read assigned reps only.
 - Reps cannot browse `pharmacy_directory` directly.
 - Directory search works through `search_pharmacy_directory(search_text)`.
+- Plan saves work through `save_monthly_plan(...)`.

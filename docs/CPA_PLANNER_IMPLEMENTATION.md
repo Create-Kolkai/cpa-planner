@@ -2,14 +2,16 @@
 
 ## Initial Audit Findings
 
-- The local workspace at `/Users/nickmeyer/Desktop/SalesRep` is not a git repository, so branch and history checks cannot be completed here.
+- The repository is now initialised at `/Users/nickmeyer/Desktop/SalesRep`.
+- Branch: `main`.
+- Remote: `https://github.com/Create-Kolkai/cpa-planner.git`.
 - The app is a Vite + React + TypeScript single-page app.
-- Current persistence is browser `localStorage` under `cpa-planner-state-v6`.
-- There is no existing Supabase client, auth flow, middleware, API route layer, server actions, migrations, or tests.
+- Phase 2 adds a fetch-based Supabase Auth/REST/RPC adapter because npm dependency installation stalled in this environment.
+- Supabase mode is controlled by `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`.
+- When Supabase is not configured, the app shows an explicit setup state before allowing local prototype mode.
 - The working planner logic is client-side and uses stored pharmacy coordinates plus approximate Haversine scoring.
 - The pharmacy list comes from `public/demo-list.csv`; many coordinates are area-level estimates.
-- The previous territory view was an abstract marker board, not a real map.
-- Vercel project metadata exists in `.vercel/project.json`, but this pass intentionally did not deploy.
+- Vercel project metadata exists locally but is ignored and was not deployed.
 
 ## Functional Features Retained
 
@@ -26,13 +28,18 @@
 - Calendar export as CSV.
 - Manager/team training-date partial replan concept.
 
-## Demo-Only Behaviour Still Present
+## Phase 2 Behaviour
 
-- Auth and Supabase data persistence are not active until Supabase environment variables and a client integration are added.
-- Browser local storage remains the runtime data store for the UI.
-- CSV import replaces the active pharmacy list instead of using the full confirm/match workflow.
-- XLSX import is not implemented yet.
-- Manager/team screen is still a single-rep local demo surface until profiles/team assignments are connected.
+- Email/password auth is implemented through Supabase Auth endpoints.
+- Sessions are stored in `sessionStorage`, enough to survive page refresh without storing client lists or plans in browser storage.
+- Profile, pharmacies, blocked dates, latest monthly plan and notifications load from Supabase after sign-in.
+- CSV import upserts representative pharmacies and records an import job when signed in.
+- Plan generation saves a versioned monthly plan through `save_monthly_plan`.
+- Moving visits and swapping days persist by saving a new plan version.
+- Availability adds/deletes persist to `blocked_dates`.
+- Legacy `cpa-planner-state-v6` data is only imported after an explicit Settings action.
+- XLSX import shows a clear dependency message until the spreadsheet parser package can be installed.
+- Manager/team UI is role-gated in Supabase mode, but full multi-rep event workflow still needs live Supabase testing.
 
 ## UX Changes Made
 
@@ -48,9 +55,10 @@
 
 ## Supabase Foundation
 
-Created migration:
+Created migrations:
 
 - `supabase/migrations/202607230001_cpa_planner_foundation.sql`
+- `supabase/migrations/202607230002_phase2_security_and_plan_rpc.sql`
 
 It includes:
 
@@ -68,6 +76,7 @@ It includes:
 - New-user profile/defaults trigger.
 - Restricted pharmacy directory search RPC.
 - RLS policies for sales reps, managers, and admins.
+- A follow-up migration tightens profile role updates, manager blocked-date writes and grants, and adds a transactional `save_monthly_plan` RPC.
 
 ## Security Notes
 
@@ -79,13 +88,11 @@ It includes:
 
 The current app uses approximate route ordering only. It must not show road distance, driving time, or road-following route geometry until a route provider is configured.
 
-## Next Implementation Steps
+## Current Limitations
 
-1. Add `@supabase/supabase-js` and wire browser auth/session handling.
-2. Create protected data-loading services for profiles, pharmacies, plans, blocked dates, and team views.
-3. Apply the migration to a clearly identified non-production Supabase project.
-4. Implement directory import from `data/source/WHF_Pharmacy_WC_July_2024.pdf` or a normalized CSV.
-5. Replace local storage reads/writes with Supabase mutations and query loading states.
-6. Add XLSX import with preview, matching, and duplicate review.
-7. Add plan persistence, versions, change log, and locked-day partial replan.
-8. Add full business and RLS tests.
+- Supabase migrations have not been applied locally or remotely because the CLI/project was not available and no remote project was identified.
+- RLS has been statically reviewed but not executed against a live Supabase database.
+- TypeScript 6.0.3 local compiler commands stall before diagnostics in this environment.
+- npm dependency installation for `@supabase/supabase-js`, `xlsx`, and `vitest` also stalled; the implementation uses a typed fetch adapter instead.
+- XLSX import is not functional until a spreadsheet parser is installed.
+- Full manager multi-rep event impact preview and in-app notification interactions require live Supabase validation.
