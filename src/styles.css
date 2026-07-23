@@ -1126,3 +1126,109 @@ td span {
     width: 100%;
   }
 }
+
+.onboarding-state,
+.map-empty-state {
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  padding: 18px;
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.onboarding-state strong,
+.map-empty-state strong {
+  color: var(--text);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(15, 23, 42, 0.32);
+  display: grid;
+  place-items: center;
+  padding: 18px;
+}
+
+.directory-modal {
+  width: min(820px, 100%);
+  max-height: min(760px, calc(100vh - 36px));
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.directory-results {
+  display: grid;
+  gap: 7px;
+}
+
+.directory-row {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.directory-row.disabled {
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+
+.directory-row strong,
+.directory-row span,
+.directory-row small {
+  display: block;
+}
+
+.directory-row small,
+.directory-row em,
+.map-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.leaflet-shell {
+  display: grid;
+  gap: 8px;
+}
+
+.territory-map {
+  height: 360px;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.map-popup {
+  display: grid;
+  gap: 3px;
+  min-width: 180px;
+  font-size: 12px;
+}
+
+.map-popup strong {
+  font-size: 13px;
+}
+
+.map-popup span,
+.map-popup em {
+  color: var(--muted);
+}
+
+.area-row {
+  width: 100%;
+}

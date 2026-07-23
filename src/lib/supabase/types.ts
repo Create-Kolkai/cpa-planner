@@ -138,7 +138,11 @@ export type DirectorySearchRow = {
   town: string | null;
   province: string | null;
   physical_address: string | null;
+  telephone: string | null;
+  latitude: number | null;
+  longitude: number | null;
   location_quality: LocationQuality;
+  location_precision: string | null;
 };
 
 export type NotificationRow = {

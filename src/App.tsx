@@ -14,31 +14,39 @@ import {
   Trash2,
   Users,
 } from "lucide-react";
+import { CircleMarker, MapContainer, Popup, TileLayer, useMap } from "react-leaflet";
 import { ChangeEvent, Dispatch, SetStateAction, useEffect, useMemo, useState } from "react";
 import { getSupabaseConfig, isDemoMode } from "./lib/supabase/config";
-import type { AuthSession, ProfileRow, RepPharmacyRow } from "./lib/supabase/types";
+import type { AuthSession, DirectorySearchRow, ProfileRow, RepPharmacyRow } from "./lib/supabase/types";
 import { currentSession, processAuthCallbackFromUrl, requestPasswordReset, resendSignUpConfirmation, signInWithPassword, signOut, signUpWithPassword } from "./services/auth-service";
 import { deleteBlockedDateByDate, listBlockedDates, upsertBlockedDate } from "./services/availability-service";
 import { confirmCsvImport } from "./services/import-service";
 import { listNotifications } from "./services/notification-service";
 import { loadLatestMonthlyPlan, saveMonthlyPlan } from "./services/planning-service";
 import { getProfile } from "./services/profile-service";
-import { listRepPharmacies } from "./services/pharmacy-service";
+import { addDirectoryPharmacyToMyList, archiveRepPharmacy, initializeDemoSalesRepWorkspace, listRepPharmacies, searchDirectory } from "./services/pharmacy-service";
 
 type TabKey = "overview" | "pharmacies" | "monthly-plan" | "availability" | "team" | "settings";
 type GradeRules = Record<string, number>;
 
 type Account = {
   id: string;
+  directoryPharmacyId?: string;
+  practiceNumber?: string;
   name: string;
   address: string;
   area: string;
+  town?: string;
+  telephone?: string;
   grade: string;
+  active?: boolean;
   lat?: number;
   lng?: number;
   coordinateSource?: string;
   coordinateConfidence?: string;
   coordinateMatch?: string;
+  locationPrecision?: string;
+  requiredVisitsOverride?: number;
 };
 
 type NonFieldDay = {
@@ -186,17 +194,24 @@ function loadState(): PersistedState {
 }
 
 function accountFromPharmacyRow(row: RepPharmacyRow): Account {
+  const area = row.suburb ?? row.town ?? "Unassigned";
   return {
     id: row.id,
+    directoryPharmacyId: row.directory_pharmacy_id ?? undefined,
+    practiceNumber: row.practice_number ?? undefined,
     name: row.pharmacy_name,
     address: row.address ?? [row.suburb, row.town, row.province].filter(Boolean).join(", "),
-    area: row.suburb ?? row.town ?? "Unassigned",
+    area,
+    town: row.town ?? undefined,
+    telephone: row.telephone ?? undefined,
     grade: row.grade,
+    active: row.active,
     lat: row.latitude ?? undefined,
     lng: row.longitude ?? undefined,
     coordinateSource: row.source,
-    coordinateConfidence: row.location_quality === "area_estimate" ? "Area-level" : row.location_quality === "unresolved" ? "Needs review" : "Located",
+    coordinateConfidence: row.location_quality === "suburb" || row.location_quality === "area_estimate" ? "Approximate town location" : row.location_quality === "unresolved" ? "Needs review" : "Located",
     coordinateMatch: row.directory_pharmacy_id ? "Directory match" : "Representative record",
+    locationPrecision: row.location_quality === "suburb" || row.location_quality === "area_estimate" ? "town" : row.location_quality,
   };
 }
 
@@ -263,15 +278,19 @@ function occurrenceNumberFromVisit(visit: Visit) {
 function pharmacyInputFromAccount(account: Account) {
   return {
     id: account.id.startsWith("csv-") || account.id.startsWith("ACT") || account.id.startsWith("O") ? undefined : account.id,
-    practiceNumber: account.id.startsWith("csv-") ? undefined : account.id,
+    directoryPharmacyId: account.directoryPharmacyId,
+    practiceNumber: account.practiceNumber ?? (account.id.startsWith("csv-") ? undefined : account.id),
     name: account.name,
     address: account.address,
     suburb: account.area,
+    town: account.town,
     province: "WESTERN CAPE",
+    telephone: account.telephone,
     lat: account.lat,
     lng: account.lng,
     locationQuality: account.lat !== undefined && account.lng !== undefined ? "area_estimate" as const : "unresolved" as const,
     grade: account.grade,
+    requiredVisitsOverride: account.requiredVisitsOverride,
     source: "import",
     active: true,
   };
@@ -603,60 +622,99 @@ function normalizeHeader(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function parseCsv(text: string): ImportResult {
-  const lines = text.split(/\r?\n/).map((row) => row.trim()).filter(Boolean);
-  if (lines.length < 2) return { accounts: [], warnings: ["The file needs a header row and at least one account row."] };
+function parseImportRows(rows: string[][]): ImportResult {
+  const cleanedRows = rows
+    .map((row) => row.map((cell) => String(cell ?? "").trim().replace(/^\uFEFF/, "")))
+    .filter((row) => row.some(Boolean));
+  if (cleanedRows.length < 2) return { accounts: [], warnings: ["The file needs a header row and at least one pharmacy row."] };
 
-  const delimiter = detectDelimiter(lines[0]);
-  const rows = lines.map((row) => parseCsvLine(row, delimiter));
-
-  const headers = rows[0].map(normalizeHeader);
+  const headers = cleanedRows[0].map(normalizeHeader);
   const find = (...names: string[]) => {
     const normalizedNames = names.map(normalizeHeader);
     return normalizedNames.map((name) => headers.indexOf(name)).find((index) => index >= 0) ?? -1;
   };
-  const nameIndex = find("account name", "name", "account", "customer", "customer name", "practice", "practice name", "doctor", "hcp", "client");
+  const nameIndex = find("account name", "pharmacy name", "name", "account", "customer", "customer name", "practice", "practice name", "doctor", "hcp", "client");
   const addressIndex = find("address", "street", "physical address", "location");
-  const areaIndex = find("suburb name", "brick name", "area", "suburb", "territory", "region", "town", "town city", "city");
+  const areaIndex = find("suburb name", "brick name", "area", "suburb", "territory", "region");
   const townIndex = find("town city", "town", "city");
   const provinceIndex = find("province");
+  const telephoneIndex = find("telephone", "phone", "phone number", "tel", "contact number");
   const gradeIndex = find("current grading", "grade", "class", "tier", "segment", "priority", "category", "previous grading");
-  const codeIndex = find("customer code", "account code", "code");
+  const codeIndex = find("practice number", "customer code", "account code", "code", "practice no");
+  const requiredIndex = find("required visits", "monthly visits", "required monthly visits", "visits");
   const latIndex = find("lat", "latitude");
   const lngIndex = find("lng", "lon", "long", "longitude");
   const coordinateSourceIndex = find("coordinate source", "location source", "geocode source");
-  const coordinateConfidenceIndex = find("coordinate confidence", "location confidence", "geocode confidence", "confidence");
+  const coordinateConfidenceIndex = find("coordinate confidence", "location confidence", "location quality", "geocode confidence", "confidence");
   const coordinateMatchIndex = find("coordinate match", "matched address", "geocode match", "match");
 
   const warnings: string[] = [];
-  if (nameIndex < 0) return { accounts: [], warnings: ["No account name column found. Use a header like Account Name, Name, Customer, Practice, Doctor, or HCP."] };
-  if (gradeIndex < 0) warnings.push("No grade column found. Imported accounts were defaulted to Grade C.");
-  if (areaIndex < 0) warnings.push("No area/suburb column found. Imported accounts were grouped as Unassigned.");
-  const accounts = rows.slice(1).flatMap((row, index) => {
+  if (nameIndex < 0) return { accounts: [], warnings: ["No pharmacy name column was found. Use a heading like Pharmacy Name, Practice Name, Account Name or Name."] };
+  if (gradeIndex < 0) warnings.push("No grade column was found. Imported pharmacies were defaulted to Grade C.");
+  if (areaIndex < 0 && townIndex < 0) warnings.push("No town or suburb column was found. Imported pharmacies were grouped as Unassigned.");
+
+  const seen = new Set<string>();
+  let duplicateRows = 0;
+  const accounts = cleanedRows.slice(1).flatMap((row, index) => {
     const name = row[nameIndex];
-    const grade = (row[gradeIndex] || "C").toUpperCase();
+    const practiceNumber = row[codeIndex] || undefined;
+    const grade = (row[gradeIndex] || "C").toUpperCase().slice(0, 1);
     if (!name || !grade) return [];
+    const key = (practiceNumber || normalizeHeader(name + row[addressIndex])).toLowerCase();
+    if (seen.has(key)) {
+      duplicateRows += 1;
+      return [];
+    }
+    seen.add(key);
     const lat = Number(row[latIndex]);
     const lng = Number(row[lngIndex]);
+    const area = row[areaIndex] || row[townIndex] || "Unassigned";
+    const requiredVisits = Number(row[requiredIndex]);
     return enrichLocation({
-      id: row[codeIndex] || `csv-${Date.now()}-${index}`,
+      id: practiceNumber || `import-${Date.now()}-${index}`,
+      practiceNumber,
       name,
       address: row[addressIndex] || [row[areaIndex], row[townIndex], row[provinceIndex]].filter(Boolean).join(", "),
-      area: row[areaIndex] || "Unassigned",
+      area,
+      town: row[townIndex] || undefined,
+      telephone: row[telephoneIndex] || undefined,
       grade,
       lat: Number.isFinite(lat) ? lat : undefined,
       lng: Number.isFinite(lng) ? lng : undefined,
       coordinateSource: row[coordinateSourceIndex] || undefined,
       coordinateConfidence: row[coordinateConfidenceIndex] || undefined,
       coordinateMatch: row[coordinateMatchIndex] || undefined,
-    });
+      locationPrecision: Number.isFinite(lat) && Number.isFinite(lng) ? "exact" : undefined,
+      ...(Number.isFinite(requiredVisits) ? { requiredVisitsOverride: requiredVisits } : {}),
+    } as Account);
   });
 
-  if (accounts.length === 0) warnings.push("No usable account rows were found after reading the file.");
-  const missingCoordinates = accounts.filter((account) => account.lat === undefined || account.lng === undefined).length;
-  if (latIndex < 0 || lngIndex < 0) warnings.push("Coordinates were estimated from suburb and brick names for route grouping.");
-  if (missingCoordinates > 0) warnings.push(`${missingCoordinates} pharmacies still need coordinates or a recognized area name.`);
+  if (duplicateRows > 0) warnings.push(`${duplicateRows} duplicate rows in the file were skipped.`);
+  if (accounts.length === 0) warnings.push("No usable pharmacy rows were found after reading the file.");
   return { accounts, warnings };
+}
+
+function parseCsv(text: string): ImportResult {
+  const lines = text.split(/\r?\n/).map((row) => row.trim()).filter(Boolean);
+  if (lines.length < 2) return { accounts: [], warnings: ["The file needs a header row and at least one pharmacy row."] };
+  const delimiter = detectDelimiter(lines[0]);
+  return parseImportRows(lines.map((row) => parseCsvLine(row, delimiter)));
+}
+
+async function parseImportFile(file: File): Promise<ImportResult> {
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  if (!extension || !["csv", "txt", "xlsx", "xls"].includes(extension)) {
+    return { accounts: [], warnings: ["Choose a CSV or Excel pharmacy file."] };
+  }
+  const XLSX = await import("xlsx");
+  const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
+  const sheetName = workbook.SheetNames[0];
+  const worksheet = sheetName ? workbook.Sheets[sheetName] : undefined;
+  if (!worksheet) return { accounts: [], warnings: ["The workbook does not contain a readable sheet."] };
+  const rows = XLSX.utils.sheet_to_json<string[]>(worksheet, { header: 1, blankrows: false, raw: false, defval: "" });
+  const result = parseImportRows(rows);
+  if (workbook.SheetNames.length > 1) result.warnings.unshift(`Imported the first worksheet, ${sheetName}.`);
+  return result;
 }
 
 function exportCsv(visits: Visit[], accounts: Account[]) {
@@ -742,6 +800,16 @@ function App() {
   const [savedPlanId, setSavedPlanId] = useState<string | null>(null);
   const [notifications, setNotifications] = useState<Array<{ id: string; title: string; body: string; read_at: string | null }>>([]);
   const [allowLocalPrototype, setAllowLocalPrototype] = useState(false);
+  const [pharmacySearch, setPharmacySearch] = useState("");
+  const [areaFilter, setAreaFilter] = useState("all");
+  const [gradeFilter, setGradeFilter] = useState("all");
+  const [activeFilter, setActiveFilter] = useState("active");
+  const [directoryOpen, setDirectoryOpen] = useState(false);
+  const [directoryQuery, setDirectoryQuery] = useState("");
+  const [directoryResults, setDirectoryResults] = useState<DirectorySearchRow[]>([]);
+  const [directoryBusy, setDirectoryBusy] = useState(false);
+  const [directoryError, setDirectoryError] = useState("");
+  const [selectedDirectoryIds, setSelectedDirectoryIds] = useState<string[]>([]);
 
   useEffect(() => {
     if (!supabaseConfig.configured) {
@@ -796,6 +864,30 @@ function App() {
     if (!supabaseConfig.configured && state.accounts.length === 0) loadDemoList("silent");
   }, [state.accounts.length, supabaseConfig.configured]);
 
+
+  useEffect(() => {
+    if (!directoryOpen || !supabaseConfig.configured) return;
+    const query = directoryQuery.trim();
+    setDirectoryError("");
+    setSelectedDirectoryIds([]);
+    if (query.length < 2) {
+      setDirectoryResults([]);
+      setDirectoryBusy(false);
+      return;
+    }
+    setDirectoryBusy(true);
+    const timer = window.setTimeout(() => {
+      searchDirectory(query, 25)
+        .then(setDirectoryResults)
+        .catch(() => {
+          setDirectoryResults([]);
+          setDirectoryError("We couldn’t load the pharmacy directory. Please try again.");
+        })
+        .finally(() => setDirectoryBusy(false));
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [directoryOpen, directoryQuery, supabaseConfig.configured]);
+
   useEffect(() => {
     if (!supabaseConfig.configured || authInitState !== "ready" || !session?.user.id) return;
     loadWorkspace(session);
@@ -830,6 +922,21 @@ function App() {
       return { account, required, planned, status };
     });
   }, [state.accounts, state.gradeRules, state.visits]);
+
+  const areaOptions = useMemo(() => Array.from(new Set(state.accounts.map((account) => account.area).filter(Boolean))).sort(), [state.accounts]);
+  const filteredCompliance = useMemo(() => {
+    const query = pharmacySearch.trim().toLowerCase();
+    return compliance.filter((row) => {
+      const account = row.account;
+      const searchMatch = !query || [account.name, account.practiceNumber, account.town, account.area, account.address].some((value) => String(value ?? "").toLowerCase().includes(query));
+      const areaMatch = areaFilter === "all" || account.area === areaFilter;
+      const gradeMatch = gradeFilter === "all" || account.grade === gradeFilter;
+      const activeMatch = activeFilter === "all" || (activeFilter === "active" ? account.active !== false : account.active === false);
+      return searchMatch && areaMatch && gradeMatch && activeMatch;
+    });
+  }, [activeFilter, areaFilter, compliance, gradeFilter, pharmacySearch]);
+  const assignedDirectoryIds = useMemo(() => new Set(state.accounts.map((account) => account.directoryPharmacyId).filter(Boolean)), [state.accounts]);
+  const assignedPracticeNumbers = useMemo(() => new Set(state.accounts.map((account) => account.practiceNumber).filter(Boolean)), [state.accounts]);
 
   const metrics = useMemo(() => {
     const required = compliance.reduce((sum, row) => sum + row.required, 0);
@@ -913,7 +1020,7 @@ function App() {
     try {
       if (authMode === "forgot") {
         await requestPasswordReset(authForm.email);
-        setAuthError("Password reset email requested. Check the configured Supabase email settings if it does not arrive.");
+        setAuthError("Password reset email requested. Check your inbox, then try again if it does not arrive.");
       } else {
         if (authMode === "sign-up") {
           const result = await signUpWithPassword(authForm.email, authForm.password, authForm.fullName);
@@ -1010,11 +1117,11 @@ function App() {
     if (!session?.user.id) return;
     const legacy = loadState();
     if (!legacy.accounts.length) {
-      setImportNotice({ tone: "warn", message: "No legacy browser demo pharmacies were found." });
+      setImportNotice({ tone: "warn", message: "No existing demo pharmacies were found." });
       return;
     }
     try {
-      const rows = await confirmCsvImport(session.user.id, "legacy browser demo state", legacy.accounts.map(pharmacyInputFromAccount), {
+      const rows = await confirmCsvImport(session.user.id, "existing demo data", legacy.accounts.map(pharmacyInputFromAccount), {
         totalRows: legacy.accounts.length,
         validRows: legacy.accounts.length,
         matchedRows: 0,
@@ -1031,56 +1138,66 @@ function App() {
         source: "legacy",
       })));
       setState((current) => ({ ...current, accounts: rows.map(accountFromPharmacyRow), nonFieldDays: legacy.nonFieldDays, visits: [] }));
-      setImportNotice({ tone: "good", message: `Imported ${rows.length} legacy pharmacies and ${legacy.nonFieldDays.length} unavailable dates into your Supabase workspace.` });
+      setImportNotice({ tone: "good", message: `Imported ${rows.length} pharmacies and ${legacy.nonFieldDays.length} unavailable dates into your workspace.` });
     } catch (error) {
-      setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Legacy migration failed." });
+      setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Import could not be completed." });
     }
   }
 
-  function handleImport(event: ChangeEvent<HTMLInputElement>) {
+  async function handleImport(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
-    if (/\.(xlsx|xls)$/i.test(file.name)) {
-      setImportNotice({ tone: "warn", message: "XLSX import workflow is prepared, but the spreadsheet parser dependency could not be installed in this environment. Export the sheet to CSV for this build." });
+    try {
+      const result = await parseImportFile(file);
+      if (!result.accounts.length) {
+        setImportNotice({ tone: "bad", message: `Import failed: ${result.warnings.join(" ")}` });
+        return;
+      }
+      const existingKeys = new Set(state.accounts.map((account) => (account.practiceNumber || account.id || account.name).toLowerCase()));
+      const newAccounts = result.accounts.filter((account) => !existingKeys.has((account.practiceNumber || account.id || account.name).toLowerCase()));
+      const duplicateRows = result.accounts.length - newAccounts.length;
+      const summary = `${newAccounts.length} new pharmacies will be imported${duplicateRows ? `, ${duplicateRows} already in your territory will be skipped` : ""}.`;
+      if (!window.confirm(summary)) return;
+      importAccounts({ ...result, accounts: newAccounts, warnings: duplicateRows ? [...result.warnings, `${duplicateRows} pharmacies were already in your territory and were skipped.`] : result.warnings }, file.name, "interactive");
+    } catch {
+      setImportNotice({ tone: "bad", message: "We couldn’t read that pharmacy file. Check the format and try again." });
+    } finally {
       event.target.value = "";
-      return;
     }
-    file.text().then((text) => {
-      importAccounts(text, file.name, "interactive");
-    }).catch(() => {
-      setImportNotice({ tone: "bad", message: "Import failed: the file could not be read by the browser." });
-    });
-    event.target.value = "";
   }
 
-  function importAccounts(text: string, sourceName: string, mode: "silent" | "interactive" = "interactive") {
-    const result = parseCsv(text);
+  function importAccounts(resultOrText: ImportResult | string, sourceName: string, mode: "silent" | "interactive" = "interactive") {
+    const result = typeof resultOrText === "string" ? parseCsv(resultOrText) : resultOrText;
     if (result.accounts.length) {
       const grades = new Set(result.accounts.map((account) => account.grade));
       const nextRules = { ...state.gradeRules };
       grades.forEach((grade) => {
         if (nextRules[grade] === undefined) nextRules[grade] = 1;
       });
-      setState((current) => ({ ...current, accounts: result.accounts, gradeRules: nextRules, visits: [] }));
+      setState((current) => {
+        const existing = new Set(current.accounts.map((account) => (account.practiceNumber || account.id || account.name).toLowerCase()));
+        const additions = result.accounts.filter((account) => !existing.has((account.practiceNumber || account.id || account.name).toLowerCase()));
+        return { ...current, accounts: [...current.accounts, ...additions], gradeRules: nextRules, visits: [] };
+      });
       setSelectedDay("");
       if (supabaseConfig.configured && session?.user.id && mode === "interactive") {
         confirmCsvImport(session.user.id, sourceName, result.accounts.map(pharmacyInputFromAccount), {
           totalRows: result.accounts.length + result.warnings.length,
           validRows: result.accounts.length,
-          matchedRows: 0,
-          unmatchedRows: result.accounts.length,
-          duplicateRows: 0,
+          matchedRows: result.accounts.filter((account) => account.directoryPharmacyId).length,
+          unmatchedRows: result.accounts.filter((account) => !account.directoryPharmacyId).length,
+          duplicateRows: result.warnings.filter((warning) => warning.toLowerCase().includes("duplicate") || warning.toLowerCase().includes("already")).length,
           errorRows: 0,
         })
           .then((rows) => {
             setState((current) => ({ ...current, accounts: rows.map(accountFromPharmacyRow), visits: [] }));
             setImportNotice({
               tone: result.warnings.length ? "warn" : "good",
-              message: `Imported and saved ${rows.length} pharmacies from ${sourceName}.${result.warnings.length ? ` ${result.warnings.join(" ")}` : ""}`,
+              message: `Imported ${rows.length} pharmacies from ${sourceName}.${result.warnings.length ? ` ${result.warnings.join(" ")}` : ""}`,
             });
           })
-          .catch((error) => {
-            setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Import could not be saved to Supabase." });
+          .catch(() => {
+            setImportNotice({ tone: "bad", message: "We couldn’t save the imported pharmacies. Please try again." });
           });
       }
       if (mode === "interactive") {
@@ -1088,7 +1205,7 @@ function App() {
         if (!supabaseConfig.configured || !session?.user.id) {
           setImportNotice({
             tone: result.warnings.length ? "warn" : "good",
-            message: `Imported ${result.accounts.length} pharmacies into local prototype mode from ${sourceName}.${result.warnings.length ? ` ${result.warnings.join(" ")}` : ""}`,
+            message: `Imported ${result.accounts.length} pharmacies from ${sourceName}.${result.warnings.length ? ` ${result.warnings.join(" ")}` : ""}`,
           });
         }
       }
@@ -1208,6 +1325,51 @@ function App() {
     });
   }
 
+  async function loadSampleTerritory() {
+    if (!demoMode) return;
+    if (state.accounts.some((account) => account.active !== false)) {
+      setImportNotice({ tone: "warn", message: "Your territory already has pharmacies, so the sample territory was not loaded again." });
+      return;
+    }
+    try {
+      if (supabaseConfig.configured && session?.user.id) {
+        const rows = await initializeDemoSalesRepWorkspace();
+        setState((current) => ({ ...current, accounts: rows.map(accountFromPharmacyRow), visits: [] }));
+        setImportNotice({ tone: "good", message: `Loaded ${rows.length} Western Cape pharmacies into your territory.` });
+      } else {
+        loadDemoList("interactive");
+      }
+    } catch {
+      setImportNotice({ tone: "bad", message: "We couldn’t load the sample territory. Please try again." });
+    }
+  }
+
+  async function addSelectedDirectoryPharmacies() {
+    if (!selectedDirectoryIds.length) return;
+    try {
+      const rows = await Promise.all(selectedDirectoryIds.map((id) => addDirectoryPharmacyToMyList(id, "B")));
+      const refreshed = supabaseConfig.configured && session?.user.id ? await listRepPharmacies(session.user.id) : rows;
+      setState((current) => ({ ...current, accounts: refreshed.map(accountFromPharmacyRow), visits: [] }));
+      setSelectedDirectoryIds([]);
+      setDirectoryOpen(false);
+      setImportNotice({ tone: "good", message: `Added ${rows.length} pharmacies to your territory.` });
+    } catch {
+      setImportNotice({ tone: "bad", message: "We couldn’t add those pharmacies. Please try again." });
+    }
+  }
+
+  async function removeAccount(account: Account) {
+    try {
+      if (supabaseConfig.configured && session?.user.id) {
+        await archiveRepPharmacy(account.id);
+      }
+      setState((current) => ({ ...current, accounts: current.accounts.filter((item) => item.id !== account.id), visits: current.visits.filter((visit) => visit.accountId !== account.id) }));
+      setImportNotice({ tone: "good", message: `${account.name} was removed from your territory.` });
+    } catch {
+      setImportNotice({ tone: "bad", message: "We couldn’t remove that pharmacy. Please try again." });
+    }
+  }
+
   function resetSample() {
     loadDemoList("interactive");
   }
@@ -1230,7 +1392,7 @@ function App() {
     setImportNotice({ tone: "good", message: "Plan generated from the current pharmacies, grade rules, and unavailable dates." });
     persistCurrentPlan("generate plan", nextVisits)
       .then(() => {
-        if (supabaseConfig.configured) setImportNotice({ tone: "good", message: "Plan generated and saved to Supabase." });
+        if (supabaseConfig.configured) setImportNotice({ tone: "good", message: "Plan generated and saved." });
       })
       .catch((error) => setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Plan generated but could not be saved." }));
   }
@@ -1343,7 +1505,7 @@ function App() {
   }
 
   if (supabaseConfig.configured && workspaceStatus === "loading") {
-    return <div className="auth-shell"><div className="auth-panel"><strong>Loading workspace...</strong><span>Restoring your Supabase session and planner data.</span></div></div>;
+    return <div className="auth-shell"><div className="auth-panel"><strong>Loading workspace...</strong><span>Restoring your planner data.</span></div></div>;
   }
 
   if (supabaseConfig.configured && workspaceStatus === "error") {
@@ -1385,16 +1547,10 @@ function App() {
         <header className="topbar">
           <div>
             <h1>{visibleTabs.find((tab) => tab.key === activeTab)?.label ?? "CPA Planner"}</h1>
-            <p>{supabaseConfig.configured ? `${profile?.email ?? session?.user.email ?? "Signed in"} · ${profile?.role ?? "profile"}` : "Local prototype mode · not persistent across devices"} · approximate route ordering</p>
+            <p>{activeTab === "pharmacies" ? "Manage the pharmacies assigned to your Western Cape territory." : activeTab === "monthly-plan" ? "Build and adjust your monthly call plan." : activeTab === "availability" ? "Mark field days, leave, training and holidays." : "Plan pharmacy visits and monitor coverage."}</p>
           </div>
           <div className="actions">
             {notifications.filter((item) => !item.read_at).length > 0 && <span className="notification-badge">{notifications.filter((item) => !item.read_at).length} unread</span>}
-            {activeTab === "pharmacies" && (
-              <label className="button secondary" title="Import CSV">
-                <FileUp size={16} /> Import CSV
-                <input type="file" accept=".csv,.txt,.xlsx,.xls" onChange={handleImport} />
-              </label>
-            )}
             {activeTab === "monthly-plan" && state.visits.length > 0 && (
               <button className="button secondary" onClick={() => exportCalendarCsv(state.visits, state.accounts, allDays, state.nonFieldDays)}><Download size={16} /> Export calendar</button>
             )}
@@ -1435,7 +1591,7 @@ function App() {
                 </button>
                 <button className="action-row" onClick={() => setActiveTab("pharmacies")}>
                   <strong>Resolve location quality</strong>
-                  <span>{state.accounts.filter((account) => account.coordinateConfidence === "Area-level" || account.lat === undefined || account.lng === undefined).length} pharmacies need better coordinates before route metrics can be exact.</span>
+                  <span>{state.accounts.filter((account) => account.coordinateConfidence === "Area-level" || account.lat === undefined || account.lng === undefined).length} pharmacies need reviewed locations before route planning can be more precise.</span>
                 </button>
               </div>
             </div>
@@ -1620,46 +1776,59 @@ function App() {
               <div className="panel-header">
                 <div>
                   <h2>My pharmacies</h2>
-                  <span>Client pharmacies used by the monthly visit planner.</span>
+                  <span>Add, organise and review the pharmacies included in your monthly visit plan.</span>
                 </div>
                 <div className="actions">
-                  <label className="button secondary" title="Import CSV">
-                    <FileUp size={16} /> Import CSV
+                  <label className="button secondary" title="Import pharmacies">
+                    <FileUp size={16} /> Import pharmacies
                     <input type="file" accept=".csv,.txt,.xlsx,.xls" onChange={handleImport} />
                   </label>
+                  <button className="button primary" onClick={() => setDirectoryOpen(true)}><Plus size={16} /> Add pharmacies</button>
                 </div>
               </div>
-              <div className="filter-row">
-                <input placeholder="Search pharmacies" aria-label="Search pharmacies" />
-                <select aria-label="Area filter"><option>All areas</option></select>
-                <select aria-label="Grade filter"><option>All grades</option><option>A</option><option>B</option><option>C</option></select>
-                <select aria-label="Active filter"><option>Active pharmacies</option><option>Archived pharmacies</option><option>All pharmacies</option></select>
-                <button className="button secondary"><Plus size={16} /> Add pharmacy</button>
-              </div>
-              <div className="table-wrap tall">
-                <table>
-                  <thead>
-                    <tr><th>Pharmacy</th><th>Area</th><th>Grade</th><th>Address</th><th>Location status</th><th>Required</th><th>Plan status</th></tr>
-                  </thead>
-                  <tbody>
-                    {compliance.map((row) => (
-                      <tr key={row.account.id}>
-                        <td><strong>{row.account.name}</strong></td>
-                        <td>{row.account.area}</td>
-                        <td>{row.account.grade}</td>
-                        <td>{row.account.address || "Not provided"}</td>
-                        <td>
-                          {row.account.lat !== undefined && row.account.lng !== undefined
-                            ? <><strong>{row.account.coordinateConfidence === "Area-level" ? "Area estimate" : "Located"}</strong><span>{row.account.coordinateSource ?? "Location"} · details available in pharmacy record</span></>
-                            : <StatusPill status="Missed" />}
-                        </td>
-                        <td>{row.required}</td>
-                        <td><StatusPill status={row.status} /></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+
+              {state.accounts.length === 0 ? (
+                <div className="onboarding-state">
+                  <strong>{demoMode ? "Set up your Western Cape territory" : "No pharmacies added yet"}</strong>
+                  <span>{demoMode ? "Load a sample pharmacy territory or choose pharmacies from the directory to build your first monthly plan." : "Add pharmacies from the Western Cape directory to start building your monthly visit plan."}</span>
+                  <div className="actions">
+                    {demoMode && <button className="button primary" onClick={loadSampleTerritory}>Load sample territory</button>}
+                    <button className="button secondary" onClick={() => setDirectoryOpen(true)}>Choose pharmacies</button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="filter-row">
+                    <input placeholder="Search my pharmacies" aria-label="Search my pharmacies" value={pharmacySearch} onChange={(event) => setPharmacySearch(event.target.value)} />
+                    <select aria-label="Area filter" value={areaFilter} onChange={(event) => setAreaFilter(event.target.value)}><option value="all">All areas</option>{areaOptions.map((area) => <option key={area} value={area}>{area}</option>)}</select>
+                    <select aria-label="Grade filter" value={gradeFilter} onChange={(event) => setGradeFilter(event.target.value)}><option value="all">All grades</option><option>A</option><option>B</option><option>C</option></select>
+                    <select aria-label="Active filter" value={activeFilter} onChange={(event) => setActiveFilter(event.target.value)}><option value="active">Active pharmacies</option><option value="archived">Archived pharmacies</option><option value="all">All pharmacies</option></select>
+                    {pharmacySearch && <button className="button secondary" onClick={() => setPharmacySearch("")}>Clear</button>}
+                  </div>
+                  <div className="table-wrap tall">
+                    <table>
+                      <thead>
+                        <tr><th>Pharmacy</th><th>Area</th><th>Grade</th><th>Address</th><th>Location</th><th>Required</th><th>Status</th><th></th></tr>
+                      </thead>
+                      <tbody>
+                        {filteredCompliance.length === 0 && <tr><td colSpan={8}><div className="empty-state">No pharmacies match your search.</div></td></tr>}
+                        {filteredCompliance.map((row) => (
+                          <tr key={row.account.id}>
+                            <td><strong>{row.account.name}</strong><span>{row.account.practiceNumber ? `Practice ${row.account.practiceNumber}` : row.account.telephone ?? ""}</span></td>
+                            <td>{row.account.area}</td>
+                            <td>{row.account.grade}</td>
+                            <td>{row.account.address || "Not provided"}</td>
+                            <td>{row.account.lat !== undefined && row.account.lng !== undefined ? <><strong>{row.account.coordinateConfidence ?? "Located"}</strong><span>{row.account.locationPrecision === "town" ? "Not the precise entrance" : ""}</span></> : <span>Needs location review</span>}</td>
+                            <td>{row.required}</td>
+                            <td><StatusPill status={row.status} /></td>
+                            <td><button className="icon-button" onClick={() => removeAccount(row.account)} title="Remove pharmacy"><Trash2 size={15} /></button></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
             </div>
           </section>
         )}
@@ -1669,22 +1838,62 @@ function App() {
             <div className="panel">
               <div className="panel-header">
                 <div>
-                  <h2>Map</h2>
-                  <span>Uses real coordinates only when a map provider is configured.</span>
+                  <h2>Territory map</h2>
+                  <span>See the pharmacies assigned to your territory and where they are located.</span>
                 </div>
               </div>
-              <TerritoryMap accounts={state.accounts} compliance={compliance} />
+              <TerritoryMap accounts={filteredCompliance.map((row) => row.account)} compliance={filteredCompliance} />
             </div>
             <div className="panel">
               <div className="panel-header">
                 <div>
                   <h2>Area summary</h2>
-                  <span>Visit demand by suburb or brick.</span>
+                  <span>Review the number of pharmacies and required visits in each area.</span>
                 </div>
               </div>
-              <AreaSummary accounts={state.accounts} compliance={compliance} />
+              <AreaSummary accounts={filteredCompliance.map((row) => row.account)} compliance={filteredCompliance} />
             </div>
           </section>
+        )}
+
+        {directoryOpen && (
+          <div className="modal-backdrop" role="dialog" aria-modal="true">
+            <div className="directory-modal">
+              <div className="panel-header">
+                <div>
+                  <h2>Add pharmacies</h2>
+                  <span>Search the Western Cape directory by name, practice number, town, suburb or address.</span>
+                </div>
+                <button className="button secondary" onClick={() => setDirectoryOpen(false)}>Close</button>
+              </div>
+              <div className="filter-row">
+                <input autoFocus placeholder="Search directory" value={directoryQuery} onChange={(event) => setDirectoryQuery(event.target.value)} />
+                <button className="button primary" onClick={addSelectedDirectoryPharmacies} disabled={!selectedDirectoryIds.length}>Add selected</button>
+              </div>
+              {directoryQuery.trim().length < 2 && <div className="empty-state">Enter at least two characters to search the directory.</div>}
+              {directoryBusy && <div className="empty-state">Searching directory...</div>}
+              {directoryError && <div className="notice bad">{directoryError}</div>}
+              {!directoryBusy && directoryQuery.trim().length >= 2 && !directoryError && directoryResults.length === 0 && <div className="empty-state">No directory pharmacies match that search. Try a pharmacy name, practice number, town or suburb.</div>}
+              <div className="directory-results">
+                {directoryResults.map((row) => {
+                  const alreadyAdded = assignedDirectoryIds.has(row.id) || (row.practice_number ? assignedPracticeNumbers.has(row.practice_number) : false);
+                  const selected = selectedDirectoryIds.includes(row.id);
+                  return (
+                    <label key={row.id} className={`directory-row ${alreadyAdded ? "disabled" : ""}`}>
+                      <input type="checkbox" checked={selected || alreadyAdded} disabled={alreadyAdded} onChange={(event) => setSelectedDirectoryIds((current) => event.target.checked ? [...current, row.id] : current.filter((id) => id !== row.id))} />
+                      <div>
+                        <strong>{row.practice_name}</strong>
+                        <span>{row.practice_number ? `Practice ${row.practice_number} · ` : ""}{row.suburb || row.town || "Western Cape"}</span>
+                        <small>{row.physical_address || "Address not provided"}{row.telephone ? ` · ${row.telephone}` : ""}</small>
+                      </div>
+                      {alreadyAdded && <em>Already added</em>}
+                    </label>
+                  );
+                })}
+              </div>
+              <button className="button secondary" onClick={() => setImportNotice({ tone: "warn", message: "Manual pharmacy capture is available through the import workflow for this demo." })}>Add manually</button>
+            </div>
+          </div>
         )}
 
         {activeTab === "availability" && (
@@ -1734,13 +1943,13 @@ function App() {
               <div className="panel-header">
                 <div>
                   <h2>Planning defaults</h2>
-                  <span>Frequency, capacity, route start, and demo workspace controls.</span>
+                  <span>Frequency, daily capacity, route start and planning defaults.</span>
                 </div>
               </div>
               {supabaseConfig.configured && (
                 <div className="demo-tools">
-                  <button className="button secondary" onClick={importLegacyLocalState}>Import existing browser demo data</button>
-                  {demoMode && <button className="button secondary" onClick={resetSample}>Load demo pharmacies locally</button>}
+                  <button className="button secondary" onClick={importLegacyLocalState}>Import existing demo data</button>
+                  {demoMode && <button className="button secondary" onClick={resetSample}>Load demo pharmacies</button>}
                 </div>
               )}
               <RulesEditor
@@ -1810,7 +2019,7 @@ function App() {
               <div className="rule-list">
                 <label className="rule-row">Plan due<input type="number" min="1" value={state.managerPlanningDueDays} onChange={(event) => setState((current) => ({ ...current, managerPlanningDueDays: Number(event.target.value) }))} /><span>days before end</span></label>
               </div>
-              <div className="empty-state">Connect Supabase roles and team assignments to show all assigned representatives here.</div>
+              <div className="empty-state">Team planning will appear after representatives are assigned to this manager.</div>
             </div>
           </section>
         )}
@@ -1819,78 +2028,25 @@ function App() {
   );
 }
 
-function planningStatus(days: string[], dueDays: number, plannedVisits: number) {
-  if (plannedVisits > 0) return "On track";
-  if (days.length === 0) return "No cycle";
-  const end = new Date(`${days[days.length - 1]}T12:00:00`);
-  const due = new Date(end);
-  due.setDate(end.getDate() - dueDays);
-  const today = new Date();
-  return today >= due ? "Due now" : `Due ${dayLabel(dateKey(due))}`;
-}
+type PlannerSettingsPatch = Partial<Pick<PersistedState, "minDailyCalls" | "dailyCapacity" | "cycleStartDay" | "routeStartAddress" | "routeStartLat" | "routeStartLng">>;
 
-function Metric({ label, value, detail, tone }: { label: string; value: string; detail: string; tone: "good" | "warn" | "bad" | "neutral" }) {
-  const Icon = tone === "good" ? CheckCircle2 : tone === "bad" ? AlertTriangle : tone === "warn" ? MoveRight : Gauge;
-  return (
-    <div className={`metric ${tone}`}>
-      <div><span>{label}</span><strong>{value}</strong><small>{detail}</small></div>
-      <Icon size={20} />
-    </div>
-  );
-}
-
-function StatusPill({ status }: { status: ComplianceRow["status"] }) {
-  return <span className={`status-pill ${status.toLowerCase().replace(" ", "-")}`}>{status}</span>;
-}
-
-function TerritoryMap({ accounts, compliance }: { accounts: Account[]; compliance: ComplianceRow[] }) {
-  const withCoords = accounts.filter((account) => account.lat !== undefined && account.lng !== undefined);
-
-  return (
-    <div className="area-board">
-      <div className="map-setup-state">
-        <MapPin size={20} />
-        <strong>Map provider not configured</strong>
-        <span>{withCoords.length} pharmacies have coordinates for approximate route ordering. Add a route/map provider before displaying a basemap, route lines, driving distance, or driving time.</span>
-      </div>
-      <AreaSummary accounts={accounts} compliance={compliance} compact />
-    </div>
-  );
-}
-
-function AreaSummary({ accounts, compliance, compact = false }: { accounts: Account[]; compliance: ComplianceRow[]; compact?: boolean }) {
-  const complianceById = new Map(compliance.map((row) => [row.account.id, row]));
-  const rows = Array.from(accounts.reduce((map, account) => {
-    const current = map.get(account.area) ?? { area: account.area, accounts: 0, required: 0, planned: 0 };
-    const row = complianceById.get(account.id);
-    current.accounts += 1;
-    current.required += row?.required ?? 0;
-    current.planned += row?.planned ?? 0;
-    map.set(account.area, current);
-    return map;
-  }, new Map<string, { area: string; accounts: number; required: number; planned: number }>()).values())
-    .sort((a, b) => b.required - a.required || a.area.localeCompare(b.area));
-
-  return (
-    <div className={compact ? "area-list compact" : "area-list"}>
-      {rows.map((row) => {
-        const rate = row.required ? Math.round((row.planned / row.required) * 100) : 0;
-        return (
-          <div key={row.area} className="area-row">
-            <div>
-              <strong>{row.area}</strong>
-              <span>{row.accounts} pharmacies</span>
-            </div>
-            <div className="area-meter">
-              <span>{row.planned}/{row.required}</span>
-              <i><b style={{ width: `${Math.min(rate, 100)}%` }} /></i>
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
+type RulesEditorProps = {
+  gradeRules: GradeRules;
+  nonFieldDays: NonFieldDay[];
+  newNonField: NonFieldDay;
+  setNewNonField: Dispatch<SetStateAction<NonFieldDay>>;
+  updateRule: (grade: string, value: number) => void;
+  minDailyCalls: number;
+  dailyCapacity: number;
+  cycleStartDay: number;
+  routeStartAddress: string;
+  routeStartLat?: number;
+  routeStartLng?: number;
+  updatePlannerSettings: (patch: PlannerSettingsPatch) => void;
+  addNonFieldDay: () => void;
+  resetSample: () => void;
+  removeNonFieldDay: (date: string) => void;
+};
 
 function RulesEditor({
   gradeRules,
@@ -1908,23 +2064,7 @@ function RulesEditor({
   addNonFieldDay,
   resetSample,
   removeNonFieldDay,
-}: {
-  gradeRules: GradeRules;
-  nonFieldDays: NonFieldDay[];
-  newNonField: { date: string; type: NonFieldDay["type"]; reason: string };
-  setNewNonField: Dispatch<SetStateAction<{ date: string; type: NonFieldDay["type"]; reason: string }>>;
-  updateRule: (grade: string, value: number) => void;
-  minDailyCalls: number;
-  dailyCapacity: number;
-  cycleStartDay: number;
-  routeStartAddress: string;
-  routeStartLat?: number;
-  routeStartLng?: number;
-  updatePlannerSettings: (patch: Partial<PersistedState>) => void;
-  addNonFieldDay: () => void;
-  resetSample: () => void;
-  removeNonFieldDay: (date: string) => void;
-}) {
+}: RulesEditorProps) {
   return (
     <>
       <div className="rule-list">
@@ -1934,7 +2074,7 @@ function RulesEditor({
         <label className="rule-row">Min visits/day<input type="number" min="0" max={dailyCapacity} value={minDailyCalls} onChange={(event) => updatePlannerSettings({ minDailyCalls: Number(event.target.value) })} /><span>visits</span></label>
         <label className="rule-row">Max visits/day<input type="number" min="1" value={dailyCapacity} onChange={(event) => updatePlannerSettings({ dailyCapacity: Number(event.target.value), minDailyCalls: Math.min(minDailyCalls, Number(event.target.value)) })} /><span>visits</span></label>
         <label className="rule-row">Cycle start<input type="number" min="1" max="28" value={cycleStartDay} onChange={(event) => updatePlannerSettings({ cycleStartDay: Number(event.target.value) })} /><span>day</span></label>
-        <button className="button secondary full" onClick={resetSample}><Users size={16} /> Reset demo workspace</button>
+        <button className="button secondary full" onClick={resetSample}><Users size={16} /> Load demo pharmacies</button>
       </div>
       <div className="route-start">
         <label>
@@ -1968,6 +2108,118 @@ function RulesEditor({
         ))}
       </div>
     </>
+  );
+}
+
+function planningStatus(days: string[], dueDays: number, plannedVisits: number) {
+  if (plannedVisits > 0) return "On track";
+  if (days.length === 0) return "No cycle";
+  const end = new Date(`${days[days.length - 1]}T12:00:00`);
+  const due = new Date(end);
+  due.setDate(end.getDate() - dueDays);
+  const today = new Date();
+  return today >= due ? "Due now" : `Due ${dayLabel(dateKey(due))}`;
+}
+
+function Metric({ label, value, detail, tone }: { label: string; value: string; detail: string; tone: "good" | "warn" | "bad" | "neutral" }) {
+  const Icon = tone === "good" ? CheckCircle2 : tone === "bad" ? AlertTriangle : tone === "warn" ? MoveRight : Gauge;
+  return (
+    <div className={`metric ${tone}`}>
+      <div><span>{label}</span><strong>{value}</strong><small>{detail}</small></div>
+      <Icon size={20} />
+    </div>
+  );
+}
+
+function StatusPill({ status }: { status: ComplianceRow["status"] }) {
+  return <span className={`status-pill ${status.toLowerCase().replace(" ", "-")}`}>{status}</span>;
+}
+
+function FitMapBounds({ accounts }: { accounts: Account[] }) {
+  const map = useMap();
+  useEffect(() => {
+    const locatable = accounts.filter((account) => account.lat !== undefined && account.lng !== undefined);
+    if (!locatable.length) {
+      map.setView([-33.9, 19.2], 7);
+      return;
+    }
+    const bounds = locatable.map((account) => [account.lat!, account.lng!] as [number, number]);
+    map.fitBounds(bounds, { padding: [24, 24], maxZoom: 13 });
+  }, [accounts, map]);
+  return null;
+}
+
+function TerritoryMap({ accounts, compliance }: { accounts: Account[]; compliance: ComplianceRow[] }) {
+  const complianceById = new Map(compliance.map((row) => [row.account.id, row]));
+  const withCoords = accounts.filter((account) => account.lat !== undefined && account.lng !== undefined);
+
+  if (!accounts.length) {
+    return <div className="map-empty-state"><MapPin size={20} /><strong>Add pharmacies to your territory to display them on the map.</strong></div>;
+  }
+
+  return (
+    <div className="leaflet-shell">
+      <MapContainer center={[-33.9, 19.2]} zoom={7} scrollWheelZoom={false} className="territory-map">
+        <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+        <FitMapBounds accounts={withCoords} />
+        {withCoords.map((account) => {
+          const row = complianceById.get(account.id);
+          const approximate = account.locationPrecision === "town" || account.coordinateConfidence?.toLowerCase().includes("approximate");
+          return (
+            <CircleMarker key={account.id} center={[account.lat!, account.lng!]} radius={7} pathOptions={{ color: approximate ? "#b7791f" : "#0f766e", fillColor: approximate ? "#f6ad55" : "#14b8a6", fillOpacity: 0.85, weight: 2 }}>
+              <Popup>
+                <div className="map-popup">
+                  <strong>{account.name}</strong>
+                  <span>{account.practiceNumber ? `Practice ${account.practiceNumber}` : account.telephone ?? ""}</span>
+                  <span>{account.area}{account.address ? ` · ${account.address}` : ""}</span>
+                  <span>Grade {account.grade} · {row?.required ?? 0} required visits</span>
+                  {approximate && <em>Approximate town location</em>}
+                </div>
+              </Popup>
+            </CircleMarker>
+          );
+        })}
+      </MapContainer>
+      {withCoords.length < accounts.length && <div className="map-note">{accounts.length - withCoords.length} pharmacies need a reviewed location before they can appear on the map.</div>}
+    </div>
+  );
+}
+
+function AreaSummary({ accounts, compliance, compact = false }: { accounts: Account[]; compliance: ComplianceRow[]; compact?: boolean }) {
+  const complianceById = new Map(compliance.map((row) => [row.account.id, row]));
+  const rows = Array.from(accounts.reduce((map, account) => {
+    const current = map.get(account.area) ?? { area: account.area, accounts: 0, required: 0, planned: 0, grades: { A: 0, B: 0, C: 0 } as Record<string, number> };
+    const row = complianceById.get(account.id);
+    current.accounts += 1;
+    current.required += row?.required ?? 0;
+    current.planned += row?.planned ?? 0;
+    current.grades[account.grade] = (current.grades[account.grade] ?? 0) + 1;
+    map.set(account.area, current);
+    return map;
+  }, new Map<string, { area: string; accounts: number; required: number; planned: number; grades: Record<string, number> }>()).values())
+    .sort((a, b) => b.required - a.required || b.accounts - a.accounts || a.area.localeCompare(b.area));
+
+  if (!rows.length) return <div className="empty-state">Area totals will appear after pharmacies are added to your territory.</div>;
+
+  return (
+    <div className={compact ? "area-list compact" : "area-list"}>
+      {rows.map((row) => {
+        const rate = row.required ? Math.min(100, Math.round((row.planned / row.required) * 100)) : 100;
+        const gradeText = Object.entries(row.grades).filter(([, count]) => count > 0).map(([grade, count]) => `${grade}: ${count}`).join(" · ");
+        return (
+          <div key={row.area} className="area-row">
+            <div>
+              <strong>{row.area}</strong>
+              <span>{row.accounts} pharmacies · {gradeText}</span>
+            </div>
+            <div className="area-meter">
+              <span>{row.planned}/{row.required} visits</span>
+              <div><i style={{ width: `${rate}%` }} /></div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 

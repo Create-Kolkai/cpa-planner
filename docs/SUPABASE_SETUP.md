@@ -15,7 +15,7 @@ Server-only:
 
 Demo/config:
 
-- `APP_DEMO_MODE`
+- `VITE_APP_DEMO_MODE`
 - `APP_URL`
 - `ROUTE_PROVIDER_MODE`
 - `MAP_PROVIDER`

@@ -56,7 +56,7 @@ export async function signInWithPassword(email: string, password: string) {
     body: { email, password },
   });
   const normalized = normalizeSession(session);
-  if (!normalized) throw new Error("Sign in succeeded but Supabase did not return a usable session.");
+  if (!normalized) throw new Error("Sign in succeeded, but we could not restore your session. Please try again.");
   storeSession(normalized);
   return normalized;
 }
@@ -122,7 +122,7 @@ export async function processAuthCallbackFromUrl(): Promise<AuthCallbackResult> 
 
   try {
     const user = await supabaseAuth<AuthSession["user"]>("user", { token: accessToken });
-    if (!user?.id) throw new Error("Supabase did not return a user for the confirmation link.");
+    if (!user?.id) throw new Error("We could not confirm that sign-in link. Please request a new link.");
     const expiresIn = Number(params.get("expires_in") ?? 0);
     const session: AuthSession = {
       access_token: accessToken,

@@ -3,7 +3,7 @@ import type { ProfileRow } from "../lib/supabase/types";
 
 export async function getProfile(userId: string) {
   const rows = await supabaseRest<ProfileRow[]>(`profiles?id=eq.${encodeURIComponent(userId)}&select=*`);
-  if (!rows[0]) throw new Error("Your profile was not created. Check the Supabase new-user trigger.");
+  if (!rows[0]) throw new Error("Your profile is not ready yet. Please contact the demo administrator.");
   return rows[0];
 }
 
