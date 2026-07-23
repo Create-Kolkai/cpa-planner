@@ -457,4 +457,87 @@ function simpleGeoPlan(accounts, days, max = 8) {
   assert.equal(searched.length, 1);
 }
 
+
+function loadingSurfaceForWorkspace({ authState, workspaceStatus, monthLoading }) {
+  if (authState === "checking" || workspaceStatus === "loading") return "global-workspace";
+  if (monthLoading) return "calendar-local";
+  return "app-shell";
+}
+
+function applyLatestMonthResponse(state, requestId, response) {
+  if (requestId !== state.latestRequestId) return state;
+  return { ...state, month: response.month, visits: response.visits, monthLoading: false, monthError: "" };
+}
+
+function shouldShowLocationWarning(visits, accountsById) {
+  return visits.some((visit) => {
+    const account = accountsById.get(visit.accountId);
+    if (!account) return false;
+    return account.locationPrecision !== "exact" || !validCoordinate(account);
+  });
+}
+
+function monthErrorState(message) {
+  return { surface: "calendar", message, retryLabel: "Try again", shellVisible: true };
+}
+
+function compactWarningStyle(viewportWidth = 1200) {
+  return {
+    marginX: viewportWidth <= 720 ? 12 : 24,
+    marginY: viewportWidth <= 720 ? 10 : 12,
+    paddingY: 10,
+    paddingX: viewportWidth <= 720 ? 12 : 14,
+    hasIcon: true,
+    wraps: true,
+  };
+}
+
+{
+  assert.equal(loadingSurfaceForWorkspace({ authState: "ready", workspaceStatus: "ready", monthLoading: true }), "calendar-local");
+  assert.notEqual(loadingSurfaceForWorkspace({ authState: "ready", workspaceStatus: "ready", monthLoading: true }), "global-workspace");
+  assert.equal(loadingSurfaceForWorkspace({ authState: "checking", workspaceStatus: "idle", monthLoading: false }), "global-workspace");
+  assert.equal(loadingSurfaceForWorkspace({ authState: "ready", workspaceStatus: "loading", monthLoading: false }), "global-workspace");
+}
+
+{
+  const shell = { sidebarVisible: true, monthlyPlanHeadingVisible: true, selectedMonth: "2026-09", monthLoading: true };
+  assert.equal(shell.sidebarVisible, true);
+  assert.equal(shell.monthlyPlanHeadingVisible, true);
+  assert.equal(shell.selectedMonth, "2026-09");
+}
+
+{
+  const state = { latestRequestId: 2, month: "2026-09", visits: [], monthLoading: true, monthError: "" };
+  const stale = applyLatestMonthResponse(state, 1, { month: "2026-08", visits: [{ id: "old" }] });
+  assert.equal(stale.month, "2026-09");
+  assert.equal(stale.visits.length, 0);
+  const fresh = applyLatestMonthResponse(state, 2, { month: "2026-10", visits: [{ id: "new" }] });
+  assert.equal(fresh.month, "2026-10");
+  assert.equal(fresh.visits[0].id, "new");
+  assert.equal(fresh.monthLoading, false);
+}
+
+{
+  const exactAccounts = new Map([["a", { id: "a", lat: -33.9, lng: 18.4, locationPrecision: "exact" }]]);
+  const approximateAccounts = new Map([["a", { id: "a", lat: -33.9, lng: 18.4, locationPrecision: "town" }]]);
+  const missingAccounts = new Map([["a", { id: "a", locationPrecision: "unknown" }]]);
+  assert.equal(shouldShowLocationWarning([{ accountId: "a" }], exactAccounts), false);
+  assert.equal(shouldShowLocationWarning([{ accountId: "a" }], approximateAccounts), true);
+  assert.equal(shouldShowLocationWarning([{ accountId: "a" }], missingAccounts), true);
+}
+
+{
+  const error = monthErrorState("We couldn’t load this month’s plan. Please try again.");
+  assert.equal(error.surface, "calendar");
+  assert.equal(error.retryLabel, "Try again");
+  assert.equal(error.shellVisible, true);
+  const desktop = compactWarningStyle(1200);
+  const mobile = compactWarningStyle(390);
+  assert.equal(desktop.hasIcon, true);
+  assert.ok(desktop.marginY <= 16);
+  assert.ok(desktop.paddingY <= 12);
+  assert.ok(mobile.marginX <= 12);
+  assert.equal(mobile.wraps, true);
+}
+
 console.log("Planner scenario tests passed");

@@ -518,6 +518,15 @@ select {
   min-width: 0;
 }
 
+select {
+  appearance: none;
+  padding-right: 34px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2317212b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 15px;
+}
+
 .month-tools {
   display: grid;
   grid-template-columns: minmax(168px, 190px) 122px 76px 76px;
@@ -1333,9 +1342,6 @@ td span {
   color: var(--warn);
 }
 
-.compact-notice {
-  margin: 0 24px 14px;
-}
 
 .day-cell.geo-warning:not(.blocked) {
   border-color: #f6ad55;
@@ -1357,5 +1363,76 @@ td span {
     right: 12px;
     left: 12px;
     width: auto;
+  }
+}
+
+.month-loading {
+  align-self: center;
+  color: var(--muted);
+  font-size: 0.84rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.calendar-frame {
+  position: relative;
+  min-height: 360px;
+}
+
+.calendar-loading-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  border-radius: 0 0 8px 8px;
+  background: rgba(246, 248, 250, 0.72);
+  color: var(--text);
+  font-weight: 800;
+  backdrop-filter: blur(1px);
+}
+
+.calendar-load-error {
+  margin: 12px 24px 0;
+  padding: 10px 12px;
+  border: 1px solid #f3b6ad;
+  border-radius: 8px;
+  background: var(--bad-bg);
+  color: var(--bad);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-weight: 750;
+}
+
+.compact-notice {
+  margin: 12px 24px;
+  padding: 10px 14px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  line-height: 1.35;
+}
+
+.compact-notice svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.compact-notice span {
+  display: block;
+}
+
+@media (max-width: 720px) {
+  .calendar-load-error {
+    margin: 10px 12px 0;
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .compact-notice {
+    margin: 10px 12px;
+    padding: 10px 12px;
   }
 }

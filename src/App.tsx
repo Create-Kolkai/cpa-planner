@@ -863,7 +863,10 @@ function App() {
   const [directoryBusy, setDirectoryBusy] = useState(false);
   const [directoryError, setDirectoryError] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isLoadingMonthlyPlan, setIsLoadingMonthlyPlan] = useState(false);
+  const [monthlyPlanError, setMonthlyPlanError] = useState("");
   const [selectedDirectoryIds, setSelectedDirectoryIds] = useState<string[]>([]);
+  const workspaceRequestId = useRef(0);
 
 
   function dismissNotification(id: string) {
@@ -896,6 +899,12 @@ function App() {
   useEffect(() => {
     setToastNotifications([]);
   }, [session?.user.id, state.month]);
+
+  useEffect(() => {
+    return () => {
+      workspaceRequestId.current += 1;
+    };
+  }, []);
 
   useEffect(() => {
     if (!supabaseConfig.configured) return;
@@ -970,7 +979,8 @@ function App() {
 
   useEffect(() => {
     if (!supabaseConfig.configured || authInitState !== "ready" || !session?.user.id) return;
-    loadWorkspace(session);
+    const mode = workspaceStatus === "ready" ? "month" : "initial";
+    loadWorkspace(session, state.month, mode);
   }, [authInitState, session?.user.id, state.month, supabaseConfig.configured]);
 
   useEffect(() => {
@@ -1073,50 +1083,70 @@ function App() {
     setState((current) => ({ ...current, gradeRules: { ...current.gradeRules, [grade]: value } }));
   }
 
-  async function loadWorkspace(activeSession: AuthSession) {
-    setWorkspaceStatus("loading");
-    setWorkspaceError("");
+  async function loadWorkspace(activeSession: AuthSession, requestedMonth = state.month, mode: "initial" | "month" = "initial") {
+    const requestId = workspaceRequestId.current + 1;
+    workspaceRequestId.current = requestId;
+    const initialLoad = mode === "initial";
+    if (initialLoad) {
+      setWorkspaceStatus("loading");
+      setWorkspaceError("");
+    } else {
+      setIsLoadingMonthlyPlan(true);
+      setMonthlyPlanError("");
+    }
     try {
-      const userProfile = await getProfile(activeSession.user.id);
-      const [pharmacyRows, blockedRows, loadedPlan, userNotifications] = await Promise.all([
+      const userProfilePromise = profile ? Promise.resolve(profile) : getProfile(activeSession.user.id);
+      const [userProfile, pharmacyRows, blockedRows, loadedPlan, userNotifications] = await Promise.all([
+        userProfilePromise,
         listRepPharmacies(activeSession.user.id),
-        listBlockedDates(activeSession.user.id, state.month),
-        loadLatestMonthlyPlan(activeSession.user.id, state.month),
-        listNotifications(activeSession.user.id).catch(() => []),
+        listBlockedDates(activeSession.user.id, requestedMonth),
+        loadLatestMonthlyPlan(activeSession.user.id, requestedMonth),
+        initialLoad ? listNotifications(activeSession.user.id).catch(() => []) : Promise.resolve(notifications),
       ]);
+      if (workspaceRequestId.current !== requestId) return;
       setProfile(userProfile);
-      setNotifications(userNotifications.map((item) => ({ id: item.id, title: item.title, body: item.body, read_at: item.read_at })));
+      if (initialLoad) setNotifications(userNotifications.map((item) => ({ id: item.id, title: item.title, body: item.body, read_at: item.read_at })));
       setSavedPlanId(loadedPlan?.plan.id ?? null);
       setState((current) => {
         const next = stateFromSupabase(current, pharmacyRows, blockedRows);
-        if (!loadedPlan) return { ...next, visits: [] };
+        if (!loadedPlan) return { ...next, month: requestedMonth, visits: [] };
         const dayById = new Map(loadedPlan.days.map((day) => [day.id, day.date]));
         return {
           ...next,
+          month: requestedMonth,
           visits: loadedPlan.visits
             .filter((visit) => visit.status === "scheduled" && visit.plan_day_id)
             .map((visit) => ({
               id: visit.id,
               accountId: visit.rep_pharmacy_id,
-              date: dayById.get(visit.plan_day_id!) ?? state.month,
+              date: dayById.get(visit.plan_day_id!) ?? requestedMonth,
               locked: visit.manually_moved,
             })),
         };
       });
       setWorkspaceStatus("ready");
     } catch (error) {
+      if (workspaceRequestId.current !== requestId) return;
       if (isExpiredAuthError(error)) {
         clearStoredSession();
         setSession(null);
         setProfile(null);
         setWorkspaceStatus("idle");
         setWorkspaceError("");
+        setIsLoadingMonthlyPlan(false);
+        setMonthlyPlanError("");
         setAuthMode("sign-in");
         setAuthError("Your session expired. Please sign in again.");
         return;
       }
-      setWorkspaceStatus("error");
-      setWorkspaceError(error instanceof Error ? error.message : "Could not load the Supabase workspace.");
+      if (initialLoad) {
+        setWorkspaceStatus("error");
+        setWorkspaceError("We couldn’t load your workspace. Please try again.");
+      } else {
+        setMonthlyPlanError("We couldn’t load this month’s plan. Please try again.");
+      }
+    } finally {
+      if (workspaceRequestId.current === requestId) setIsLoadingMonthlyPlan(false);
     }
   }
 
@@ -1634,7 +1664,7 @@ function App() {
         <div className="auth-panel">
           <strong>Could not load workspace</strong>
           <div className="notice bad">{workspaceError}</div>
-          <button className="button secondary" onClick={() => session && loadWorkspace(session)}>Retry</button>
+          <button className="button secondary" onClick={() => session && loadWorkspace(session, state.month, "initial")}>Retry</button>
           <button className="button secondary" onClick={handleSignOut}>Sign out</button>
         </div>
       </div>
@@ -1675,7 +1705,7 @@ function App() {
               <button className="button secondary" onClick={() => exportCalendarCsv(state.visits, state.accounts, allDays, state.nonFieldDays)}><Download size={16} /> Export calendar</button>
             )}
             {activeTab === "monthly-plan" && (
-              <button className="button primary" onClick={generate} disabled={isGenerating}><Play size={16} /> {isGenerating ? "Building your visit plan…" : "Generate plan"}</button>
+              <button className="button primary" onClick={generate} disabled={isGenerating || isLoadingMonthlyPlan}><Play size={16} /> {isGenerating ? "Building your visit plan…" : "Generate plan"}</button>
             )}
             {supabaseConfig.configured && <button className="button secondary" onClick={handleSignOut}>Sign out</button>}
           </div>
@@ -1740,14 +1770,18 @@ function App() {
                 <span>Move visits between field days to adjust the month.</span>
               </div>
               <div className="month-tools">
-                <input aria-label="Planning month" type="month" value={state.month} onChange={(event) => setState((current) => ({ ...current, month: event.target.value, visits: [] }))} />
+                <input aria-label="Planning month" type="month" value={state.month} aria-busy={isLoadingMonthlyPlan} onChange={(event) => setState((current) => ({ ...current, month: event.target.value, visits: supabaseConfig.configured ? current.visits : [] }))} />
+                {isLoadingMonthlyPlan && <span className="month-loading">Loading {new Date(`${state.month}-01T12:00:00`).toLocaleDateString(undefined, { month: "long" })} plan…</span>}
                 <label>Cycle start <input type="number" min="1" max="28" value={state.cycleStartDay} onChange={(event) => setState((current) => ({ ...current, cycleStartDay: Number(event.target.value), visits: [] }))} /></label>
                 <label>Min <input type="number" min="0" max={state.dailyCapacity} value={state.minDailyCalls} onChange={(event) => setState((current) => ({ ...current, minDailyCalls: Number(event.target.value) }))} /></label>
                 <label>Max <input type="number" min="1" value={state.dailyCapacity} onChange={(event) => setState((current) => ({ ...current, dailyCapacity: Number(event.target.value), minDailyCalls: Math.min(current.minDailyCalls, Number(event.target.value)) }))} /></label>
               </div>
             </div>
-            {planHasLocationWarnings && state.visits.length > 0 && <div className="notice warn compact-notice">Some pharmacies have approximate or missing locations. Review the highlighted visits before finalising your plan.</div>}
-            <div className="calendar-grid">
+            {planHasLocationWarnings && state.visits.length > 0 && <div className="notice warn compact-notice"><AlertTriangle size={16} /><span>Some pharmacy locations are approximate or missing. Review the highlighted visits before finalising your plan.</span></div>}
+            <div className="calendar-frame">
+              {monthlyPlanError && <div className="calendar-load-error"><span>{monthlyPlanError}</span><button className="button secondary" onClick={() => session && loadWorkspace(session, state.month, "month")}>Try again</button></div>}
+              {isLoadingMonthlyPlan && <div className="calendar-loading-overlay">Loading {new Date(`${state.month}-01T12:00:00`).toLocaleDateString(undefined, { month: "long" })} plan…</div>}
+              <div className="calendar-grid">
               {allDays.map((day) => {
                 const count = visitsByDay.get(day)?.length ?? 0;
                 const blocked = isWeekend(day) || nonFieldSet.has(day);
@@ -1768,6 +1802,7 @@ function App() {
                   </button>
                 );
               })}
+              </div>
             </div>
           </div>
 
@@ -1783,7 +1818,7 @@ function App() {
                   <option value="">Swap day</option>
                   {availableDays.filter((day) => day !== selectedDay).map((day) => <option key={day} value={day}>{day}</option>)}
                 </select>
-                <button className="button secondary" onClick={() => swapDayCalls(selectedDay, swapTargetDay)} disabled={!swapTargetDay}>Swap</button>
+                <button className="button secondary" onClick={() => swapDayCalls(selectedDay, swapTargetDay)} disabled={!swapTargetDay || isLoadingMonthlyPlan}>Swap</button>
               </div>
             </div>
             <div className="visit-list">
