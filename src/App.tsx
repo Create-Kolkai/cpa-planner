@@ -13,9 +13,10 @@ import {
   Table2,
   Trash2,
   Users,
+  X,
 } from "lucide-react";
 import { CircleMarker, MapContainer, Popup, TileLayer, useMap } from "react-leaflet";
-import { ChangeEvent, Dispatch, SetStateAction, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, Dispatch, SetStateAction, useEffect, useMemo, useRef, useState } from "react";
 import { getSupabaseConfig, isDemoMode } from "./lib/supabase/config";
 import type { AuthSession, DirectorySearchRow, ProfileRow, RepPharmacyRow } from "./lib/supabase/types";
 import { clearStoredSession, currentSession, isExpiredAuthError, processAuthCallbackFromUrl, requestPasswordReset, resendSignUpConfirmation, signInWithPassword, signOut, signUpWithPassword } from "./services/auth-service";
@@ -96,6 +97,19 @@ type ImportNotice = {
   message: string;
 };
 
+type ToastType = "success" | "info" | "warning" | "error";
+
+type ToastNotification = {
+  id: string;
+  type: ToastType;
+  message: string;
+  title?: string;
+  createdAt: number;
+  durationMs?: number | null;
+  dedupeKey?: string;
+  action?: { label: string; onClick: () => void };
+};
+
 type AuthMode = "sign-in" | "sign-up" | "forgot" | "check-email";
 type AuthInitState = "idle" | "checking" | "ready" | "error";
 
@@ -103,6 +117,21 @@ type WorkspaceLoadState = "idle" | "loading" | "ready" | "error";
 
 const STORAGE_KEY = "cpa-planner-state-v6";
 const DEMO_LIST_URL = "/demo-list.csv";
+
+const proximityRules = {
+  preferredPairKm: 25,
+  softDailyRadiusKm: 35,
+  strongPenaltyKm: 50,
+  hardPairKm: 75,
+  unknownLocationPenalty: 140,
+};
+
+const toastDurations: Record<ToastType, number | null> = {
+  success: 5000,
+  info: 5000,
+  warning: 8000,
+  error: null,
+};
 
 const defaultRules: GradeRules = {
   A: 2,
@@ -377,37 +406,90 @@ function enrichLocation(account: Account) {
   };
 }
 
-function distanceKm(a?: { lat?: number; lng?: number }, b?: { lat?: number; lng?: number }) {
-  if (a?.lat === undefined || a.lng === undefined || b?.lat === undefined || b.lng === undefined) return 35;
+function validCoordinate(point?: { lat?: number; lng?: number }) {
+  return Number.isFinite(point?.lat) && Number.isFinite(point?.lng) && Math.abs(point!.lat!) <= 90 && Math.abs(point!.lng!) <= 180;
+}
+
+function calculateDistanceKm(a?: { lat?: number; lng?: number }, b?: { lat?: number; lng?: number }) {
+  if (!validCoordinate(a) || !validCoordinate(b)) return null;
   const earthRadius = 6371;
   const toRad = (value: number) => (value * Math.PI) / 180;
-  const dLat = toRad(b.lat - a.lat);
-  const dLng = toRad(b.lng - a.lng);
-  const lat1 = toRad(a.lat);
-  const lat2 = toRad(b.lat);
+  const dLat = toRad(b!.lat! - a!.lat!);
+  const dLng = toRad(b!.lng! - a!.lng!);
+  const lat1 = toRad(a!.lat!);
+  const lat2 = toRad(b!.lat!);
   const h =
     Math.sin(dLat / 2) * Math.sin(dLat / 2) +
     Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
   return earthRadius * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
 }
 
-function routeRegion(area: string) {
-  const normalized = normalizeArea(area);
-  if (["WATERFRONT", "GREEN POINT", "SEA POINT", "CAPE TOWN", "FORESHORE", "GARDENS"].includes(normalized)) return "01 Atlantic CBD";
-  if (["OBSERVATORY", "MAITLAND", "PINELANDS", "RONDEBOSCH", "KENILWORTH", "LANSDOWNE", "ATHLONE", "GATESVILLE"].includes(normalized)) return "02 Inner Southern";
-  if (["PLUMSTEAD", "OTTERY", "TOKAI", "MUIZENBERG", "SUN VALLEY", "SIMON'S TOWN", "GRASSY PARK", "PELICAN PARK"].includes(normalized)) return "03 Southern Peninsula";
-  if (["AIRPORT INDUSTRIA", "CHARLESVILLE", "ELSIES RIVER", "BELHAR", "DELFT", "GUGULETU", "PHILIPPI", "MITCHELLS PLAIN", "LENTEGEUR", "MAKHAZA", "KHAYELITSHA", "MFULENI"].includes(normalized)) return "04 Cape Flats";
-  if (["EERSTE RIVER", "FAURE", "MACASSAR", "SOMERSET WEST", "HELDERBERG", "STRAND", "GORDON'S BAY"].includes(normalized)) return "05 Helderberg";
-  if (["HERMANUS", "SANDBAAI", "CALEDON", "BREDASDORP", "SWELLENDAM"].includes(normalized)) return "06 Overberg";
-  return "07 Other";
+function distanceKm(a?: { lat?: number; lng?: number }, b?: { lat?: number; lng?: number }) {
+  return calculateDistanceKm(a, b) ?? proximityRules.unknownLocationPenalty;
 }
 
-function routeClusterKey(chunk: { region: string; lat?: number; lng?: number; area: string }) {
-  if (chunk.lat === undefined || chunk.lng === undefined) return `${chunk.region}:${chunk.area}`;
-  const lat = Math.round(chunk.lat / 0.09) * 0.09;
-  const lng = Math.round(chunk.lng / 0.09) * 0.09;
-  return `${chunk.region}:${lat.toFixed(2)}:${lng.toFixed(2)}`;
+function locationKey(account: Account) {
+  return normalizeArea(account.area || account.town || account.address || "Unknown");
 }
+
+function locationConfidence(account: Account) {
+  if (!validCoordinate(account)) return "unknown";
+  if (account.locationPrecision === "exact" || account.coordinateConfidence === "Located") return "exact";
+  if (account.locationPrecision === "town" || account.coordinateConfidence?.toLowerCase().includes("approximate") || account.coordinateConfidence === "Area-level") return "approximate";
+  return "approximate";
+}
+
+function daySpanKm(items: Array<{ account: Account }>) {
+  let span = 0;
+  for (let index = 0; index < items.length; index += 1) {
+    for (let other = index + 1; other < items.length; other += 1) {
+      const distance = calculateDistanceKm(items[index].account, items[other].account);
+      if (distance !== null) span = Math.max(span, distance);
+    }
+  }
+  return span;
+}
+
+function routeRegion(area: string) {
+  const normalized = normalizeArea(area);
+  if (["WATERFRONT", "GREEN POINT", "SEA POINT", "CAPE TOWN", "FORESHORE", "GARDENS"].includes(normalized)) return "Cape Town CBD";
+  if (["OBSERVATORY", "MAITLAND", "PINELANDS", "RONDEBOSCH", "KENILWORTH", "LANSDOWNE", "ATHLONE", "GATESVILLE"].includes(normalized)) return "Inner Southern Suburbs";
+  if (["PLUMSTEAD", "OTTERY", "TOKAI", "MUIZENBERG", "SUN VALLEY", "SIMON'S TOWN", "GRASSY PARK", "PELICAN PARK"].includes(normalized)) return "Southern Peninsula";
+  if (["AIRPORT INDUSTRIA", "CHARLESVILLE", "ELSIES RIVER", "BELHAR", "DELFT", "GUGULETU", "PHILIPPI", "MITCHELLS PLAIN", "LENTEGEUR", "MAKHAZA", "KHAYELITSHA", "MFULENI"].includes(normalized)) return "Cape Flats";
+  if (["EERSTE RIVER", "FAURE", "MACASSAR", "SOMERSET WEST", "HELDERBERG", "STRAND", "GORDON'S BAY"].includes(normalized)) return "Helderberg";
+  if (["HERMANUS", "SANDBAAI", "CALEDON", "BREDASDORP", "SWELLENDAM"].includes(normalized)) return "Overberg";
+  return area || "Other";
+}
+
+function orderRouteItems(items: RouteItemForPlan[], startPoint?: { lat?: number; lng?: number }) {
+  const remaining = items.slice().sort((a, b) => a.account.id.localeCompare(b.account.id));
+  const ordered: RouteItemForPlan[] = [];
+  let currentPoint = validCoordinate(startPoint)
+    ? startPoint
+    : remaining
+      .filter((item) => validCoordinate(item.account))
+      .slice()
+      .sort((a, b) => a.account.lat! - b.account.lat! || a.account.lng! - b.account.lng! || a.account.id.localeCompare(b.account.id))[0]?.account;
+
+  while (remaining.length) {
+    const nextIndex = remaining
+      .map((item, index) => ({ item, index, distance: distanceKm(currentPoint, item.account) }))
+      .sort((a, b) => a.distance - b.distance || a.item.account.area.localeCompare(b.item.account.area) || a.item.account.name.localeCompare(b.item.account.name) || a.item.account.id.localeCompare(b.item.account.id))[0].index;
+    const [next] = remaining.splice(nextIndex, 1);
+    ordered.push(next);
+    if (validCoordinate(next.account)) currentPoint = next.account;
+  }
+
+  return ordered;
+}
+
+type RouteItemForPlan = {
+  account: Account;
+  sequence: number;
+  required: number;
+  locationKey: string;
+  confidence: "exact" | "approximate" | "unknown";
+};
 
 function generatePlan(accounts: Account[], rules: GradeRules, month: string, nonFieldDays: NonFieldDay[], capacity: number, minDailyCalls: number, cycleStartDay: number, startPoint?: { lat?: number; lng?: number }) {
   const availableDays = fieldDays(month, nonFieldDays, cycleStartDay);
@@ -416,172 +498,143 @@ function generatePlan(accounts: Account[], rules: GradeRules, month: string, non
   const generated: Visit[] = [];
   if (availableDays.length === 0) return generated;
 
-  const areaGroups = new Map<string, Account[]>();
-  accounts.forEach((account) => {
-    const group = areaGroups.get(account.area) ?? [];
-    group.push(account);
-    areaGroups.set(account.area, group);
+  const sourceAccounts = accounts
+    .filter((account) => account.active !== false)
+    .map(enrichLocation)
+    .sort((a, b) => locationKey(a).localeCompare(locationKey(b)) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+
+  const itemsByRound = new Map<number, RouteItemForPlan[]>();
+  sourceAccounts.forEach((account) => {
+    const required = Math.max(0, Number(account.requiredVisitsOverride ?? rules[account.grade] ?? 0));
+    for (let sequence = 1; sequence <= required; sequence += 1) {
+      const items = itemsByRound.get(sequence) ?? [];
+      items.push({ account, sequence, required, locationKey: locationKey(account), confidence: locationConfidence(account) });
+      itemsByRound.set(sequence, items);
+    }
   });
-
-  type RouteItem = {
-    account: Account;
-    sequence: number;
-    required: number;
-  };
-
-  type RouteChunk = {
-    area: string;
-    region: string;
-    cluster: string;
-    round: number;
-    items: RouteItem[];
-    lat?: number;
-    lng?: number;
-  };
 
   type DayRoute = {
     day: string;
-    items: RouteItem[];
-    areas: Set<string>;
+    items: RouteItemForPlan[];
     accountIds: Set<string>;
-    region?: string;
-    cluster?: string;
-    lat?: number;
-    lng?: number;
+    locationKeys: Set<string>;
+    centroid?: { lat: number; lng: number };
   };
 
-  const chunks = Array.from(areaGroups.entries()).flatMap(([area, group]) => {
-    const enrichedGroup = group
-      .map((account) => ({ account, required: Math.max(0, Number(rules[account.grade] ?? 0)) }))
-      .filter((item) => item.required > 0)
-      .sort((a, b) => gradeSortValue(a.account.grade) - gradeSortValue(b.account.grade) || a.account.name.localeCompare(b.account.name));
-    const maxRequired = Math.max(...enrichedGroup.map((item) => item.required), 0);
-    const reference = enrichedGroup.find((item) => item.account.lat !== undefined && item.account.lng !== undefined)?.account;
-    const areaChunks: RouteChunk[] = [];
-
-    for (let round = 1; round <= maxRequired; round += 1) {
-      const roundItems = enrichedGroup
-        .filter((item) => item.required >= round)
-        .map((item) => ({ account: item.account, sequence: round, required: item.required }));
-      const chunkCount = Math.max(1, Math.ceil(roundItems.length / dailyCap));
-      const chunkSize = Math.ceil(roundItems.length / chunkCount);
-
-      for (let index = 0; index < roundItems.length; index += chunkSize) {
-        const unit = {
-          area,
-          region: routeRegion(area),
-          round,
-          items: roundItems.slice(index, index + chunkSize),
-          lat: reference?.lat,
-          lng: reference?.lng,
-        };
-        areaChunks.push({ ...unit, cluster: routeClusterKey(unit) });
-      }
-    }
-
-    return areaChunks;
-  }).sort((a, b) => {
-    const regionDelta = a.region.localeCompare(b.region);
-    if (regionDelta) return regionDelta;
-    if (a.round !== b.round) return a.round - b.round;
-    if (a.lat !== undefined && b.lat !== undefined && Math.abs(a.lat - b.lat) > 0.035) return b.lat - a.lat;
-    if (a.lng !== undefined && b.lng !== undefined) return a.lng - b.lng;
-    return a.area.localeCompare(b.area);
-  });
-
-  const dayRoutes: DayRoute[] = availableDays.map((day) => ({
-    day,
-    items: [],
-    areas: new Set<string>(),
-    accountIds: new Set<string>(),
-  }));
-
+  const dayRoutes: DayRoute[] = availableDays.map((day) => ({ day, items: [], accountIds: new Set(), locationKeys: new Set() }));
   const visitsByAccount = new Map<string, string[]>();
-  const monthCapacity = availableDays.length * dailyCap;
-  const requiredVisits = chunks.reduce((sum, chunk) => sum + chunk.items.length, 0);
-  const infeasibleMonth = requiredVisits > monthCapacity;
-
-  function minimumGap(item: RouteItem) {
-    return Math.max(1, Math.floor(availableDays.length / Math.max(item.required, 1)) - 1);
-  }
+  const distanceCache = new Map<string, number | null>();
+  const requiredVisits = Array.from(itemsByRound.values()).reduce((sum, items) => sum + items.length, 0);
+  const infeasibleMonth = requiredVisits > availableDays.length * dailyCap;
 
   function dayIndex(day: string) {
     return availableDays.indexOf(day);
   }
 
-  function spacingPenalty(route: DayRoute, chunk: RouteChunk) {
-    return chunk.items.reduce((sum, item) => {
-      const existing = visitsByAccount.get(item.account.id) ?? [];
-      if (existing.length === 0) return sum;
-      const closestGap = Math.min(...existing.map((day) => Math.abs(dayIndex(route.day) - dayIndex(day))));
-      return sum + Math.max(0, minimumGap(item) - closestGap) * 18;
-    }, 0);
+  function cachedDistance(a: Account | { id?: string; lat?: number; lng?: number } | undefined, b: Account | { id?: string; lat?: number; lng?: number } | undefined) {
+    const aKey = a?.id ?? `${a?.lat ?? "na"}:${a?.lng ?? "na"}`;
+    const bKey = b?.id ?? `${b?.lat ?? "na"}:${b?.lng ?? "na"}`;
+    const key = aKey < bKey ? `${aKey}|${bKey}` : `${bKey}|${aKey}`;
+    if (!distanceCache.has(key)) distanceCache.set(key, calculateDistanceKm(a, b));
+    return distanceCache.get(key)!;
   }
 
-  function routeDistance(route: DayRoute, chunk: RouteChunk) {
-    if (route.items.length === 0) return 0;
-    return distanceKm(route, chunk);
+  function minimumGap(item: RouteItemForPlan) {
+    return Math.max(1, Math.floor(availableDays.length / Math.max(item.required, 1)) - 1);
   }
 
-  function chunkScore(route: DayRoute, chunk: RouteChunk) {
-    const projectedLoad = route.items.length + chunk.items.length;
-    const duplicateAccounts = chunk.items.some((item) => route.accountIds.has(item.account.id));
-    const overload = Math.max(0, projectedLoad - dailyCap);
-    const regionPenalty = route.region && route.region !== chunk.region ? 70 : 0;
-    const clusterPenalty = route.cluster && route.cluster !== chunk.cluster ? 15000 : 0;
-    const areaBonus = route.areas.has(chunk.area) ? -16 : 0;
-    const emptyRoutePenalty = route.items.length === 0 ? 6 : 0;
-    const startPenalty = route.items.length === 0 ? distanceKm(startPoint, chunk) * 0.45 : 0;
-    const minBonus = route.items.length > 0 && route.items.length < dailyMin ? -45 : 0;
-    const loadPenalty = route.items.length >= dailyMin ? (route.items.length / dailyCap) * 12 : route.items.length * 1.5;
-    const hardLimitPenalty = !infeasibleMonth && overload > 0 ? 10000 : overload * 650;
-    return hardLimitPenalty + (duplicateAccounts ? 10000 : 0) + clusterPenalty + regionPenalty + routeDistance(route, chunk) * 2.2 + startPenalty + spacingPenalty(route, chunk) + loadPenalty + emptyRoutePenalty + areaBonus + minBonus;
-  }
-
-  function placeChunk(chunk: RouteChunk) {
-    const viableRoutes = dayRoutes.filter((route) => {
-      const duplicateAccounts = chunk.items.some((item) => route.accountIds.has(item.account.id));
-      const projectedLoad = route.items.length + chunk.items.length;
-      return !duplicateAccounts && (infeasibleMonth || projectedLoad <= dailyCap);
+  function routeSpanIfAdded(route: DayRoute, item: RouteItemForPlan) {
+    let span = 0;
+    route.items.forEach((existing) => {
+      const distance = cachedDistance(existing.account, item.account);
+      if (distance !== null) span = Math.max(span, distance);
     });
-    const routePool = viableRoutes.length ? viableRoutes : dayRoutes;
-    const sameClusterPool = routePool.filter((route) => !route.cluster || route.cluster === chunk.cluster);
-    const sameRegionPool = routePool.filter((route) => !route.region || route.region === chunk.region);
-    const bestRoute = (sameClusterPool.length ? sameClusterPool : sameRegionPool.length ? sameRegionPool : routePool)
-      .slice()
-      .sort((a, b) => chunkScore(a, chunk) - chunkScore(b, chunk))[0];
-    if (!bestRoute) return;
+    return span;
+  }
 
-    bestRoute.items.push(...chunk.items);
-    bestRoute.areas.add(chunk.area);
-    chunk.items.forEach((item) => bestRoute.accountIds.add(item.account.id));
-    if (!bestRoute.region) bestRoute.region = chunk.region;
-    if (!bestRoute.cluster) bestRoute.cluster = chunk.cluster;
-    const positioned = bestRoute.items.map((item) => item.account).filter((account) => account.lat !== undefined && account.lng !== undefined);
-    if (positioned.length) {
-      bestRoute.lat = positioned.reduce((sum, account) => sum + account.lat!, 0) / positioned.length;
-      bestRoute.lng = positioned.reduce((sum, account) => sum + account.lng!, 0) / positioned.length;
+  function updateCentroid(route: DayRoute) {
+    const positioned = route.items.filter((item) => validCoordinate(item.account));
+    if (!positioned.length) {
+      route.centroid = undefined;
+      return;
     }
-    chunk.items.forEach((item) => {
-      const dates = visitsByAccount.get(item.account.id) ?? [];
-      dates.push(bestRoute.day);
-      visitsByAccount.set(item.account.id, dates);
-    });
+    route.centroid = {
+      lat: positioned.reduce((sum, item) => sum + item.account.lat!, 0) / positioned.length,
+      lng: positioned.reduce((sum, item) => sum + item.account.lng!, 0) / positioned.length,
+    };
   }
 
-  chunks.forEach(placeChunk);
+  function spacingPenalty(route: DayRoute, item: RouteItemForPlan) {
+    const existing = visitsByAccount.get(item.account.id) ?? [];
+    if (!existing.length) return 0;
+    const closestGap = Math.min(...existing.map((day) => Math.abs(dayIndex(route.day) - dayIndex(day))));
+    return Math.max(0, minimumGap(item) - closestGap) * 80;
+  }
+
+  function scoreRoute(route: DayRoute, item: RouteItemForPlan, strictDistance: boolean) {
+    const projectedLoad = route.items.length + 1;
+    const overload = Math.max(0, projectedLoad - dailyCap);
+    if (!infeasibleMonth && overload > 0) return Number.POSITIVE_INFINITY;
+    if (route.accountIds.has(item.account.id)) return Number.POSITIVE_INFINITY;
+
+    const centroidDistance = route.items.length ? distanceKm(route.centroid, item.account) : distanceKm(startPoint, item.account) * 0.25;
+    const maxPairDistance = routeSpanIfAdded(route, item);
+    const sameKnownArea = route.locationKeys.has(item.locationKey);
+    const hasUnknownLocation = item.confidence === "unknown" || route.items.some((existing) => existing.confidence === "unknown");
+    const differentUnknownArea = hasUnknownLocation && route.items.length > 0 && !sameKnownArea;
+    const approximatePenalty = item.confidence === "approximate" ? 8 : item.confidence === "unknown" ? proximityRules.unknownLocationPenalty : 0;
+
+    if (strictDistance && route.items.length > 0) {
+      if (differentUnknownArea) return Number.POSITIVE_INFINITY;
+      if (maxPairDistance > proximityRules.hardPairKm && !sameKnownArea) return Number.POSITIVE_INFINITY;
+    }
+
+    const radiusPenalty = maxPairDistance > proximityRules.hardPairKm
+      ? 6000 + (maxPairDistance - proximityRules.hardPairKm) * 150
+      : maxPairDistance > proximityRules.strongPenaltyKm
+        ? 1200 + (maxPairDistance - proximityRules.strongPenaltyKm) * 45
+        : maxPairDistance > proximityRules.softDailyRadiusKm
+          ? 260 + (maxPairDistance - proximityRules.softDailyRadiusKm) * 16
+          : maxPairDistance > proximityRules.preferredPairKm
+            ? (maxPairDistance - proximityRules.preferredPairKm) * 5
+            : 0;
+    const fillBonus = route.items.length > 0 && route.items.length < dailyMin && maxPairDistance <= proximityRules.softDailyRadiusKm ? -18 : 0;
+    const areaBonus = sameKnownArea ? -60 : 0;
+    const loadPenalty = route.items.length >= dailyMin ? route.items.length * 8 : route.items.length * 2;
+
+    return overload * 1000 + centroidDistance * 7 + radiusPenalty + spacingPenalty(route, item) + approximatePenalty + loadPenalty + fillBonus + areaBonus;
+  }
+
+  function placeItem(item: RouteItemForPlan) {
+    const route = [true, false]
+      .flatMap((strict) => dayRoutes.map((dayRoute) => ({ route: dayRoute, score: scoreRoute(dayRoute, item, strict), strict })))
+      .filter((candidate) => Number.isFinite(candidate.score))
+      .sort((a, b) => a.score - b.score || a.route.items.length - b.route.items.length || a.route.day.localeCompare(b.route.day))[0]?.route;
+    if (!route) return;
+    route.items.push(item);
+    route.accountIds.add(item.account.id);
+    route.locationKeys.add(item.locationKey);
+    updateCentroid(route);
+    const dates = visitsByAccount.get(item.account.id) ?? [];
+    dates.push(route.day);
+    visitsByAccount.set(item.account.id, dates);
+  }
+
+  Array.from(itemsByRound.entries())
+    .sort((a, b) => a[0] - b[0])
+    .forEach(([, items]) => {
+      const seededItems = items.slice().sort((a, b) => {
+        const aFromStart = distanceKm(startPoint, a.account);
+        const bFromStart = distanceKm(startPoint, b.account);
+        return bFromStart - aFromStart || a.locationKey.localeCompare(b.locationKey) || a.account.name.localeCompare(b.account.name) || a.account.id.localeCompare(b.account.id);
+      });
+      seededItems.forEach(placeItem);
+    });
 
   dayRoutes.forEach((route) => {
-    route.items
-      .slice()
-      .sort((a, b) => {
-        const areaDelta = a.account.area.localeCompare(b.account.area);
-        if (areaDelta) return areaDelta;
-        return gradeSortValue(a.account.grade) - gradeSortValue(b.account.grade) || a.account.name.localeCompare(b.account.name);
-      })
-      .forEach((item) => {
-        generated.push({ id: `${item.account.id}-${item.sequence}-${route.day}`, accountId: item.account.id, date: route.day });
-      });
+    orderRouteItems(route.items, startPoint).forEach((item) => {
+      generated.push({ id: `${item.account.id}-${item.sequence}-${route.day}`, accountId: item.account.id, date: route.day });
+    });
   });
 
   return generated;
@@ -783,7 +836,7 @@ function App() {
   const demoMode = isDemoMode();
   const [state, setState] = useState<PersistedState>(() => (supabaseConfig.configured ? defaultStateForMonth() : loadState()));
   const [activeTab, setActiveTab] = useState<TabKey>("overview");
-  const [importNotice, setImportNotice] = useState<ImportNotice | null>(null);
+  const [toastNotifications, setToastNotifications] = useState<ToastNotification[]>([]);
   const [selectedDay, setSelectedDay] = useState<string>("");
   const [swapTargetDay, setSwapTargetDay] = useState<string>("");
   const [newNonField, setNewNonField] = useState({ date: `${state.month}-15`, type: "Leave" as NonFieldDay["type"], reason: "" });
@@ -809,13 +862,40 @@ function App() {
   const [directoryResults, setDirectoryResults] = useState<DirectorySearchRow[]>([]);
   const [directoryBusy, setDirectoryBusy] = useState(false);
   const [directoryError, setDirectoryError] = useState("");
+  const [isGenerating, setIsGenerating] = useState(false);
   const [selectedDirectoryIds, setSelectedDirectoryIds] = useState<string[]>([]);
+
+
+  function dismissNotification(id: string) {
+    setToastNotifications((current) => current.filter((notification) => notification.id !== id));
+  }
+
+  function notify(notification: Omit<ToastNotification, "id" | "createdAt" | "durationMs"> & { durationMs?: number | null }) {
+    const createdAt = Date.now();
+    setToastNotifications((current) => {
+      const withoutDuplicate = notification.dedupeKey ? current.filter((item) => item.dedupeKey !== notification.dedupeKey) : current;
+      return [{ ...notification, id: `${createdAt}-${Math.random().toString(16).slice(2)}`, createdAt, durationMs: notification.durationMs ?? toastDurations[notification.type] }, ...withoutDuplicate].slice(0, 3);
+    });
+  }
+
+  function setImportNotice(notice: ImportNotice | null) {
+    if (!notice) return;
+    notify({
+      type: notice.tone === "good" ? "success" : notice.tone === "bad" ? "error" : "warning",
+      message: notice.message,
+      dedupeKey: notice.message,
+    });
+  }
 
   useEffect(() => {
     if (!supabaseConfig.configured) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     }
   }, [state, supabaseConfig.configured]);
+
+  useEffect(() => {
+    setToastNotifications([]);
+  }, [session?.user.id, state.month]);
 
   useEffect(() => {
     if (!supabaseConfig.configured) return;
@@ -960,8 +1040,24 @@ function App() {
     };
   }, [availableDays, compliance, state.dailyCapacity, state.minDailyCalls, state.visits, visitsByDay]);
 
+  const activeAssignedAccounts = useMemo(() => state.accounts.filter((account) => account.active !== false), [state.accounts]);
+  const activeAssignedCount = useMemo(() => {
+    const keys = new Set(activeAssignedAccounts.map((account) => account.directoryPharmacyId || account.practiceNumber || account.id));
+    return keys.size;
+  }, [activeAssignedAccounts]);
+  const filteredActiveCount = useMemo(() => filteredCompliance.filter((row) => row.account.active !== false).length, [filteredCompliance]);
   const selectedVisits = visitsByDay.get(selectedDay) ?? [];
-  const selectedAreas = Array.from(new Set(selectedVisits.map((visit) => accountById.get(visit.accountId)?.area).filter((area): area is string => Boolean(area))));
+  const selectedVisitAccounts = selectedVisits.map((visit) => accountById.get(visit.accountId)).filter((account): account is Account => Boolean(account));
+  const selectedAreas = Array.from(new Set(selectedVisitAccounts.map((account) => account.area).filter(Boolean)));
+  const selectedDaySpanKm = daySpanKm(selectedVisitAccounts.map((account) => ({ account: enrichLocation(account) })));
+  const selectedApproxCount = selectedVisitAccounts.filter((account) => locationConfidence(enrichLocation(account)) === "approximate").length;
+  const selectedUnknownCount = selectedVisitAccounts.filter((account) => locationConfidence(enrichLocation(account)) === "unknown").length;
+  const selectedMainRegion = selectedVisitAccounts.length ? routeRegion(selectedVisitAccounts[0].area) : "";
+  const selectedDayHasTravelWarning = selectedDaySpanKm > proximityRules.strongPenaltyKm || selectedUnknownCount > 0;
+  const planHasLocationWarnings = state.visits.some((visit) => {
+    const account = accountById.get(visit.accountId);
+    return account ? locationConfidence(enrichLocation(account)) !== "exact" : false;
+  });
   const nonFieldSet = new Set(state.nonFieldDays.map((day) => day.date));
   const tabs: Array<{ key: TabKey; label: string; icon: typeof Gauge }> = [
     { key: "overview", label: "Overview", icon: Gauge },
@@ -1072,6 +1168,7 @@ function App() {
     setSession(null);
     setProfile(null);
     setWorkspaceStatus("idle");
+    setToastNotifications([]);
     setState(defaultStateForMonth());
   }
 
@@ -1258,6 +1355,7 @@ function App() {
       visits: current.visits.filter((visit) => visit.date !== newNonField.date),
     }));
     setNewNonField((current) => ({ ...current, reason: "" }));
+    setImportNotice({ tone: "good", message: "Unavailable date added." });
   }
 
   function removeUnavailableDate(date: string) {
@@ -1271,6 +1369,7 @@ function App() {
       nonFieldDays: current.nonFieldDays.filter((item) => item.date !== date),
       visits: current.visits.filter((visit) => visit.date !== date),
     }));
+    setImportNotice({ tone: "good", message: "Unavailable date removed." });
   }
 
   function moveVisit(visitId: string, date: string) {
@@ -1279,11 +1378,15 @@ function App() {
       ...current,
       visits: current.visits.map((visit) => (visit.id === visitId ? { ...visit, date, locked: true } : visit)),
     }));
+    setImportNotice({ tone: "good", message: "Visit moved." });
     persistCurrentPlan("move visit", nextVisits).catch((error) => setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Visit move could not be saved." }));
   }
 
   function removeVisit(visitId: string) {
+    const nextVisits = state.visits.filter((visit) => visit.id !== visitId);
     setState((current) => ({ ...current, visits: current.visits.filter((visit) => visit.id !== visitId) }));
+    setImportNotice({ tone: "good", message: "Visit removed." });
+    persistCurrentPlan("remove visit", nextVisits).catch((error) => setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Visit removal could not be saved." }));
   }
 
   function swapDayCalls(sourceDay: string, targetDay: string) {
@@ -1303,6 +1406,7 @@ function App() {
     }));
     setSelectedDay(targetDay);
     setSwapTargetDay("");
+    setImportNotice({ tone: "good", message: "Day calls swapped." });
     persistCurrentPlan("swap day", nextVisits).catch((error) => setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Day swap could not be saved." }));
   }
 
@@ -1384,27 +1488,33 @@ function App() {
     loadDemoList("interactive");
   }
 
-  function generate() {
-    const nextVisits = generatePlan(
-      state.accounts,
-      state.gradeRules,
-      state.month,
-      state.nonFieldDays,
-      state.dailyCapacity,
-      state.minDailyCalls,
-      state.cycleStartDay,
-      { lat: state.routeStartLat, lng: state.routeStartLng },
-    );
-    setState((current) => ({
-      ...current,
-      visits: nextVisits,
-    }));
-    setImportNotice({ tone: "good", message: "Plan generated from the current pharmacies, grade rules, and unavailable dates." });
-    persistCurrentPlan("generate plan", nextVisits)
-      .then(() => {
-        if (supabaseConfig.configured) setImportNotice({ tone: "good", message: "Plan generated and saved." });
-      })
-      .catch((error) => setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Plan generated but could not be saved." }));
+  async function generate() {
+    if (isGenerating) return;
+    if (state.visits.length && !window.confirm("Regenerating the plan will replace your current visit arrangement.")) return;
+    setIsGenerating(true);
+    try {
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      const nextVisits = generatePlan(
+        state.accounts,
+        state.gradeRules,
+        state.month,
+        state.nonFieldDays,
+        state.dailyCapacity,
+        state.minDailyCalls,
+        state.cycleStartDay,
+        { lat: state.routeStartLat, lng: state.routeStartLng },
+      );
+      setState((current) => ({
+        ...current,
+        visits: nextVisits,
+      }));
+      await persistCurrentPlan("generate plan", nextVisits);
+      setImportNotice({ tone: "good", message: `Your ${new Date(`${state.month}-01T12:00:00`).toLocaleDateString(undefined, { month: "long", year: "numeric" })} visit plan has been generated.` });
+    } catch (error) {
+      setImportNotice({ tone: "bad", message: error instanceof Error ? error.message : "Plan could not be generated." });
+    } finally {
+      setIsGenerating(false);
+    }
   }
 
   function addManagerTrainingDay() {
@@ -1557,7 +1667,7 @@ function App() {
         <header className="topbar">
           <div>
             <h1>{visibleTabs.find((tab) => tab.key === activeTab)?.label ?? "CPA Planner"}</h1>
-            <p>{activeTab === "pharmacies" ? "Manage the pharmacies assigned to your Western Cape territory." : activeTab === "monthly-plan" ? "Build and adjust your monthly call plan." : activeTab === "availability" ? "Mark field days, leave, training and holidays." : "Plan pharmacy visits and monitor coverage."}</p>
+            <p>{activeTab === "pharmacies" ? "Manage the pharmacies assigned to your Western Cape territory." : activeTab === "monthly-plan" ? "Build and adjust your monthly pharmacy visit plan." : activeTab === "availability" ? "Mark field days, leave, training and holidays." : "Plan pharmacy visits and monitor coverage."}</p>
           </div>
           <div className="actions">
             {notifications.filter((item) => !item.read_at).length > 0 && <span className="notification-badge">{notifications.filter((item) => !item.read_at).length} unread</span>}
@@ -1565,7 +1675,7 @@ function App() {
               <button className="button secondary" onClick={() => exportCalendarCsv(state.visits, state.accounts, allDays, state.nonFieldDays)}><Download size={16} /> Export calendar</button>
             )}
             {activeTab === "monthly-plan" && (
-              <button className="button primary" onClick={generate}><Play size={16} /> {state.visits.length ? "Replan" : "Generate plan"}</button>
+              <button className="button primary" onClick={generate} disabled={isGenerating}><Play size={16} /> {isGenerating ? "Building your visit plan…" : "Generate plan"}</button>
             )}
             {supabaseConfig.configured && <button className="button secondary" onClick={handleSignOut}>Sign out</button>}
           </div>
@@ -1579,7 +1689,7 @@ function App() {
           </section>
         )}
 
-        {importNotice && <div className={`notice ${importNotice.tone}`}>{importNotice.message}</div>}
+        <ToastStack notifications={toastNotifications} onDismiss={dismissNotification} />
 
         {activeTab === "overview" && (
           <section className="overview-grid">
@@ -1636,6 +1746,7 @@ function App() {
                 <label>Max <input type="number" min="1" value={state.dailyCapacity} onChange={(event) => setState((current) => ({ ...current, dailyCapacity: Number(event.target.value), minDailyCalls: Math.min(current.minDailyCalls, Number(event.target.value)) }))} /></label>
               </div>
             </div>
+            {planHasLocationWarnings && state.visits.length > 0 && <div className="notice warn compact-notice">Some pharmacies have approximate or missing locations. Review the highlighted visits before finalising your plan.</div>}
             <div className="calendar-grid">
               {allDays.map((day) => {
                 const count = visitsByDay.get(day)?.length ?? 0;
@@ -1643,11 +1754,13 @@ function App() {
                 const overload = count > state.dailyCapacity;
                 const underload = !blocked && count > 0 && count < state.minDailyCalls;
                 const isToday = day === todayKey();
+                const dayAccounts = (visitsByDay.get(day) ?? []).map((visit) => accountById.get(visit.accountId)).filter((account): account is Account => Boolean(account));
+                const geographicWarning = daySpanKm(dayAccounts.map((account) => ({ account: enrichLocation(account) }))) > proximityRules.strongPenaltyKm || dayAccounts.some((account) => locationConfidence(enrichLocation(account)) === "unknown");
                 const blockedText = blockedLabel(day, state.nonFieldDays);
                 return (
                   <button
                     key={day}
-                    className={`day-cell ${selectedDay === day ? "selected" : ""} ${isToday ? "today" : ""} ${blocked ? "blocked" : ""} ${overload ? "overload" : ""} ${underload ? "underload" : ""}`}
+                    className={`day-cell ${selectedDay === day ? "selected" : ""} ${isToday ? "today" : ""} ${blocked ? "blocked" : ""} ${overload ? "overload" : ""} ${underload ? "underload" : ""} ${geographicWarning ? "geo-warning" : ""}`}
                     onClick={() => setSelectedDay(day)}
                   >
                     <span>{dayLabel(day)}</span>
@@ -1663,6 +1776,7 @@ function App() {
               <div>
                 <h2>{selectedDay || "Select a day"}</h2>
                 <span>{selectedVisits.length} planned visits{selectedAreas.length ? ` · ${selectedAreas.slice(0, 3).join(", ")}${selectedAreas.length > 3 ? ` +${selectedAreas.length - 3}` : ""}` : ""}</span>
+                {selectedVisits.length > 1 && <small className={selectedDayHasTravelWarning ? "day-quality warn" : "day-quality"}>{selectedMainRegion} · Approx. {Math.round(selectedDaySpanKm)} km span{selectedApproxCount ? ` · ${selectedApproxCount} approximate` : ""}{selectedUnknownCount ? ` · ${selectedUnknownCount} needs review` : ""}</small>}
               </div>
               <div className="swap-tools">
                 <select value={swapTargetDay} onChange={(event) => setSwapTargetDay(event.target.value)} title="Swap with day">
@@ -1785,8 +1899,8 @@ function App() {
             <div className="panel">
               <div className="panel-header">
                 <div>
-                  <h2>My pharmacies</h2>
-                  <span>Add, organise and review the pharmacies included in your monthly visit plan.</span>
+                  <div className="title-with-count"><h2>My pharmacies</h2><span>{activeAssignedCount} pharmacies in your territory</span></div>
+                  <span>{filteredActiveCount !== activeAssignedCount ? `${filteredActiveCount} matching · ` : ""}Add, organise and review the pharmacies included in your monthly visit plan.</span>
                 </div>
                 <div className="actions">
                   <label className="button secondary" title="Import pharmacies">
@@ -2118,6 +2232,58 @@ function RulesEditor({
         ))}
       </div>
     </>
+  );
+}
+
+function ToastStack({ notifications, onDismiss }: { notifications: ToastNotification[]; onDismiss: (id: string) => void }) {
+  return (
+    <div className="toast-stack" aria-label="Notifications">
+      {notifications.map((notification) => <ToastItem key={notification.id} notification={notification} onDismiss={onDismiss} />)}
+    </div>
+  );
+}
+
+function ToastItem({ notification, onDismiss }: { notification: ToastNotification; onDismiss: (id: string) => void }) {
+  const [paused, setPaused] = useState(false);
+  const remainingMs = useRef(notification.durationMs ?? null);
+  const startedAt = useRef<number | null>(null);
+
+  useEffect(() => {
+    remainingMs.current = notification.durationMs ?? null;
+  }, [notification.durationMs, notification.id]);
+
+  useEffect(() => {
+    if (paused || remainingMs.current === null) return undefined;
+    startedAt.current = Date.now();
+    const timer = window.setTimeout(() => onDismiss(notification.id), remainingMs.current);
+    return () => {
+      window.clearTimeout(timer);
+      if (startedAt.current !== null) {
+        remainingMs.current = Math.max(0, (remainingMs.current ?? 0) - (Date.now() - startedAt.current));
+      }
+    };
+  }, [notification.id, onDismiss, paused]);
+
+  const role = notification.type === "error" ? "alert" : "status";
+  return (
+    <div
+      className={`toast ${notification.type}`}
+      role={role}
+      aria-live={notification.type === "error" ? "assertive" : "polite"}
+      onMouseEnter={() => setPaused(true)}
+      onMouseLeave={() => setPaused(false)}
+      onFocus={() => setPaused(true)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setPaused(false);
+      }}
+    >
+      <div>
+        {notification.title && <strong>{notification.title}</strong>}
+        <span>{notification.message}</span>
+        {notification.action && <button className="toast-action" onClick={notification.action.onClick}>{notification.action.label}</button>}
+      </div>
+      <button className="toast-close" aria-label="Dismiss notification" onClick={() => onDismiss(notification.id)}><X size={15} /></button>
+    </div>
   );
 }
 
